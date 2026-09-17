@@ -847,25 +847,45 @@ function parseKotak(grid) {
   const colValDate = norm.indexOf('ValueDate');
   const colDesc = norm.indexOf('Description');
   const colChq = norm.findIndex(n => n.includes('Chq') || n.includes('Ref'));
-  const colAmt = norm.indexOf('Amount');
-  const colCrDr = norm.indexOf('Dr/Cr');
   const colBal = norm.indexOf('Balance');
-  if ([colSl, colDesc, colAmt, colCrDr, colBal].some(i => i === -1)) return null;
+  const colCrDr = norm.indexOf('Dr/Cr');
+  const colAmt = norm.indexOf('Amount');      // older Kotak export: combined Amount + sign
+  const colDebit = norm.indexOf('Debit');     // newer Kotak export: split Debit/Credit
+  const colCredit = norm.indexOf('Credit');
+
+  const hasCombinedAmount = colAmt !== -1;
+  const hasSplitDebitCredit = colDebit !== -1 && colCredit !== -1;
+  if (colSl === -1 || colDesc === -1 || colBal === -1 || (!hasCombinedAmount && !hasSplitDebitCredit)) return null;
+
   const out = [];
   let sl = 1;
   for (let r = hr + 1; r < grid.length; r++) {
     const row = grid[r] || [];
-    if (!isPureNumber(row[colSl])) continue;
+    if (!isPureNumber(row[colSl])) continue; // skips the "Closing balance" footer row
     const txnDate = parseDMY(row[colTxnDate]);
     const valDate = parseDMY(row[colValDate]);
     let chq = String(row[colChq] ?? '').trim();
     if (chq === '-') chq = '';
     const desc = String(row[colDesc] ?? '').trim();
-    const crdr = String(row[colCrDr] ?? '').trim().toUpperCase();
-    const amt = cleanNumber(row[colAmt]);
     const bal = cleanNumber(row[colBal]);
-    out.push({ sl: sl++, txnDate, valDate, chq, desc,
-      debit: crdr === 'DR' ? amt : 0, credit: crdr === 'CR' ? amt : 0, bal, crdr });
+
+    let debit, credit, crdr;
+    if (hasCombinedAmount) {
+      // Older layout: the Dr/Cr column right next to Amount IS the transaction's sign.
+      crdr = String(row[colCrDr] ?? '').trim().toUpperCase();
+      const amt = cleanNumber(row[colAmt]);
+      debit = crdr === 'DR' ? amt : 0;
+      credit = crdr === 'CR' ? amt : 0;
+    } else {
+      // Newer layout: Debit/Credit are already split. The one Dr/Cr column
+      // here sits right after Balance and reflects the BALANCE's sign
+      // (almost always "CR" for a healthy account) - not the individual
+      // transaction's direction. Always derive Dr/Cr from the amounts instead.
+      debit = cleanNumber(row[colDebit]);
+      credit = cleanNumber(row[colCredit]);
+      crdr = debit > 0 ? 'DR' : (credit > 0 ? 'CR' : '');
+    }
+    out.push({ sl: sl++, txnDate, valDate, chq, desc, debit, credit, bal, crdr });
   }
   return out;
 }
