@@ -570,6 +570,7 @@
           <option value="hdfc">HDFC Bank</option>
           <option value="axis">Axis Bank</option>
           <option value="pnb">PNB</option>
+          <option value="sbi">SBI (State Bank of India)</option>
         </select>
         <button class="tb-btn primary" id="convertBtn" disabled>
           <span class="spinner"></span>
@@ -660,6 +661,7 @@
         <li><strong>HDFC Bank</strong>: two-digit years, asterisk divider rows, and a trailing "Opening Balance" row that's correctly excluded.</li>
         <li><strong>Axis Bank</strong>: only one date column (used for both Transaction and Value Date); stops at the "Charge breakup" section.</li>
         <li><strong>PNB</strong>: only one date column; Balance carries a trailing "Cr."/"Dr." suffix that's stripped.</li>
+        <li><strong>SBI</strong>: only one date column; "Details" cells often contain embedded line breaks that get collapsed into one clean line; Ref No/Cheque No. is usually blank, so the LEFT(4)-of-Description fallback applies here too.</li>
       </ul>
       <div class="about-line">Every parser, and the Excel/CSV file generation, runs entirely in this browser tab — nothing is uploaded anywhere. The "Choose Folder" option (Chrome/Edge only) uses your browser's native File System Access permission so exports save straight into that folder without asking again, until you click "Change Folder" yourself.</div>
     </details>
@@ -1020,6 +1022,46 @@ function parsePNB(grid) {
   return out;
 }
 
+// SBI (State Bank of India): Date, Details, Ref No/Cheque No, Debit,
+// Credit, Balance. No serial column (generated here); only ONE date
+// column (used for both Transaction and Value Date); "Details" cells
+// routinely contain embedded line breaks from Excel's cell-wrap, which
+// are collapsed into a single clean line; "Ref No/Cheque No" is usually
+// blank, left as-is here since fillChqFromDescription() applies the same
+// LEFT(4) fallback used for every other bank. A letterhead/account-summary
+// preamble precedes the header, and a "Statement Summary" section follows
+// the transaction list - both are skipped by stopping at the first row
+// whose Date cell doesn't parse as a genuine date.
+function parseSBI(grid) {
+  const hr = findHeaderRow(grid, ['Date', 'Details']);
+  if (hr === -1) return null;
+  const c = colMapByHeader(grid, hr);
+  const need = ['Date', 'Details', 'Debit', 'Credit'];
+  for (const k of need) if (!(k in c)) return null;
+  const out = [];
+  let sl = 1;
+  for (let r = hr + 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    const txnDate = parseDMY(row[c['Date']]);
+    if (!txnDate) break; // hit the blank row / "Statement Summary" section - stop
+    let chq = 'Ref No/Cheque No' in c ? String(row[c['Ref No/Cheque No']] ?? '').trim() : '';
+    if (chq === '-') chq = '';
+    const desc = cleanMultilineText(row[c['Details']]);
+    const debit = cleanNumber(row[c['Debit']]);
+    const credit = cleanNumber(row[c['Credit']]);
+    const bal = 'Balance' in c ? cleanNumber(row[c['Balance']]) : 0;
+    const crdr = debit > 0 ? 'DR' : (credit > 0 ? 'CR' : '');
+    out.push({ sl: sl++, txnDate, valDate: txnDate, chq, desc, debit, credit, bal, crdr });
+  }
+  return out;
+}
+
+// Collapses embedded line breaks / tabs / repeated whitespace from a
+// wrapped Excel cell (SBI's "Details" column) into one clean line.
+function cleanMultilineText(v) {
+  return String(v ?? '').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
 // When a bank doesn't give a real cheque/reference number, the Description
 // usually starts with the transaction mode instead (e.g. "NEFT/ICIN209505...",
 // "IMPS/...", "RTGS/...", "UPI/..."). Rather than leaving Chq / Ref No.
@@ -1043,6 +1085,7 @@ const PARSERS = [
   { id: 'hdfc', label: 'HDFC Bank', fn: parseHDFC },
   { id: 'axis', label: 'Axis Bank', fn: parseAxis },
   { id: 'pnb', label: 'PNB (Punjab National Bank)', fn: parsePNB },
+  { id: 'sbi', label: 'SBI (State Bank of India)', fn: parseSBI },
 ];
 
 
@@ -1107,6 +1150,3381 @@ let saveDirHandle = null; // File System Access API directory handle, once chose
 const BANK_COLORS = {
   'icici_quick': '#1F7A5C', 'icici_saving': '#2E6FE0', 'kotak': '#C0452E',
   'canara': '#6B4FA0', 'hdfc': '#B8860B', 'axis': '#1595A8', 'pnb': '#A6395A',
+  'sbi': '#2E7D32',
+};
+
+function setStatus(msg, kind) {
+  if (!msg) { statusEl.style.display = 'none'; return; }
+  const icon = kind === 'ok' ? '✓' : kind === 'err' ? '⚠' : '…';
+  statusEl.innerHTML = `<strong>${icon}</strong> ${msg}`;
+  statusEl.className = 'status' + (kind ? ' ' + kind : '');
+  statusEl.style.display = 'flex';
+}
+
+function setTopPill(kind, text) {
+  topStatusPill.className = 'pill ' + kind;
+  topStatusPill.innerHTML = `<span class="pill-dot"></span> ${text}`;
+}
+
+function setBtnLoading(btn, loading) {
+  btn.classList.toggle('loading', loading);
+  btn.disabled = loading;
+}
+
+// ============================================================
+// File selection (Import button + native input; no drag/drop chrome
+// needed now that Import lives in the toolbar, but the input itself
+// still accepts a click-triggered pick)
+// ============================================================
+importBtn.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => pickFile(fileInput.files[0]));
+pendingFileClear.addEventListener('click', () => { fileInput.value = ''; pickFile(null); });
+
+function pickFile(file) {
+  currentFile = file || null;
+  convertBtn.disabled = !currentFile;
+  if (currentFile) {
+    pendingFile.classList.add('show');
+    pendingFileName.textContent = `${currentFile.name} (${(currentFile.size / 1024).toFixed(1)} KB)`;
+  } else {
+    pendingFile.classList.remove('show');
+  }
+}
+
+function gridFromSheet(workbook) {
+  const ws = workbook.Sheets[workbook.SheetNames[0]];
+  return XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: true });
+}
+
+function readFileAsGrid(file) {
+  return new Promise((resolve, reject) => {
+    const ext = file.name.split('.').pop().toLowerCase();
+    if (ext === 'csv') {
+      const reader = new FileReader();
+      reader.onload = e => resolve(Papa.parse(e.target.result, { skipEmptyLines: false }).data);
+      reader.onerror = reject;
+      reader.readAsText(file);
+    } else {
+      const reader = new FileReader();
+      reader.onload = e => {
+        try { resolve(gridFromSheet(XLSX.read(e.target.result, { type: 'array', cellDates: true }))); }
+        catch (err) { reject(err); }
+      };
+      reader.onerror = reject;
+      reader.readAsArrayBuffer(file);
+    }
+  });
+}
+
+// ============================================================
+// Convert & Add - parses the picked file and appends to the running
+// records list (tagged with source file name + detected format)
+// ============================================================
+convertBtn.addEventListener('click', async () => {
+  if (!currentFile) return;
+  setStatus('Reading file…', 'info');
+  setTopPill('neutral', 'Working…');
+  setBtnLoading(convertBtn, true);
+  try {
+    const grid = await readFileAsGrid(currentFile);
+    const choice = formatSelect.value;
+    let rows = null, matchedId = null, matchedLabel = null;
+
+    if (choice === 'auto') {
+      for (const p of PARSERS) {
+        const r = p.fn(grid);
+        if (r && r.length > 0) { rows = r; matchedId = p.id; matchedLabel = p.label; break; }
+      }
+      if (!rows) {
+        setStatus('Could not recognise this file as any supported format. Try picking the bank manually from the dropdown.', 'err');
+        setTopPill('warn', 'Not recognised');
+        return;
+      }
+    } else {
+      const p = PARSERS.find(p => p.id === choice);
+      rows = p.fn(grid);
+      matchedId = p.id; matchedLabel = p.label;
+      if (!rows || rows.length === 0) {
+        setStatus(`Could not find "${matchedLabel}" columns in this file. Double-check the format, or try Auto-detect.`, 'err');
+        setTopPill('warn', 'Not recognised');
+        return;
+      }
+    }
+
+    rows = fillChqFromDescription(rows);
+    rows.forEach(r => { r._source = currentFile.name; r._formatId = matchedId; r._formatLabel = matchedLabel; });
+    allRecords = allRecords.concat(rows);
+
+    setStatus(`Detected: ${matchedLabel} — ${rows.length} transaction(s) added (${allRecords.length} total).`, 'ok');
+    setTopPill('ready', 'Ready');
+    fileInput.value = '';
+    pickFile(null);
+    renderAll();
+  } catch (err) {
+    console.error(err);
+    setStatus('Something went wrong reading that file: ' + err.message, 'err');
+    setTopPill('warn', 'Error');
+  } finally {
+    setBtnLoading(convertBtn, false);
+  }
+});
+
+clearBtn.addEventListener('click', () => {
+  if (allRecords.length === 0) return;
+  if (!confirm(`Remove all ${allRecords.length} imported transaction(s)? This can't be undone.`)) return;
+  allRecords = [];
+  setStatus('All records cleared.', 'info');
+  setTopPill('neutral', 'Idle');
+  renderAll();
+});
+
+// ============================================================
+// Search + filter
+// ============================================================
+filterPills.addEventListener('click', e => {
+  const pill = e.target.closest('.filter-pill');
+  if (!pill) return;
+  currentFilter = pill.dataset.f;
+  document.querySelectorAll('.filter-pill').forEach(p => p.classList.toggle('active', p === pill));
+  renderTable();
+});
+searchInput.addEventListener('input', () => renderTable());
+
+function matchesFilter(row, filter) {
+  if (filter === 'debit') return row.debit > 0;
+  if (filter === 'credit') return row.credit > 0;
+  if (filter === 'incomplete') return !row.txnDate || !row.valDate || !row.desc;
+  return true;
+}
+
+function getFilteredRecords() {
+  const term = searchInput.value.trim().toLowerCase();
+  return allRecords.filter(row => {
+    if (!matchesFilter(row, currentFilter)) return false;
+    if (!term) return true;
+    return (row.desc || '').toLowerCase().includes(term) || (row.chq || '').toLowerCase().includes(term);
+  });
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function renderAll() {
+  renderStats();
+  renderBankBadges();
+  renderTable();
+}
+
+function renderStats() {
+  const files = new Set(allRecords.map(r => r._source)).size;
+  const totalDebit = allRecords.reduce((s, r) => s + (r.debit || 0), 0);
+  const totalCredit = allRecords.reduce((s, r) => s + (r.credit || 0), 0);
+  statFiles.textContent = files;
+  statTxn.textContent = allRecords.length;
+  statDebit.textContent = totalDebit.toFixed(2);
+  statCredit.textContent = totalCredit.toFixed(2);
+}
+
+function renderBankBadges() {
+  if (allRecords.length === 0) {
+    bankBadgesEl.innerHTML = `<div class="bank-badges-empty">Import a statement to see per-bank totals here.</div>`;
+    return;
+  }
+  const counts = {};
+  allRecords.forEach(r => { counts[r._formatLabel] = (counts[r._formatLabel] || 0) + 1; });
+  const html = Object.entries(counts).map(([label, n]) => {
+    const id = allRecords.find(r => r._formatLabel === label)._formatId;
+    const color = BANK_COLORS[id] || '#5B6472';
+    return `<div class="bank-badge"><span class="swatch-dot" style="background:${color};"></span>${escapeHtml(label)} <span class="count">${n}</span></div>`;
+  }).join('');
+  bankBadgesEl.innerHTML = `<div class="bank-badges">${html}</div>`;
+}
+
+function renderTable() {
+  const filtered = getFilteredRecords();
+
+  // filter pill counts (against full record set, independent of search box)
+  document.getElementById('fpAll').textContent = allRecords.length;
+  document.getElementById('fpDebit').textContent = allRecords.filter(r => matchesFilter(r, 'debit')).length;
+  document.getElementById('fpCredit').textContent = allRecords.filter(r => matchesFilter(r, 'credit')).length;
+  document.getElementById('fpIncomplete').textContent = allRecords.filter(r => matchesFilter(r, 'incomplete')).length;
+
+  resultsBody.innerHTML = '';
+
+  if (allRecords.length === 0) {
+    tableWrap.style.display = 'none';
+    emptyState.style.display = 'flex';
+    tableLegend.style.display = 'none';
+    return;
+  }
+  tableWrap.style.display = 'block';
+  emptyState.style.display = 'none';
+  tableLegend.style.display = 'flex';
+
+  filtered.forEach((row, idx) => {
+    const incomplete = !row.txnDate || !row.valDate || !row.desc;
+    const tr = document.createElement('tr');
+    if (incomplete) tr.className = 'incomplete';
+    tr.innerHTML = `
+      <td>${idx + 1}</td>
+      <td>${fmtDate(row.txnDate)}</td>
+      <td>${fmtDate(row.valDate)}</td>
+      <td>${row.chq || ''}</td>
+      <td class="desc">${escapeHtml(row.desc)}</td>
+      <td class="num debit-amt">${row.debit ? row.debit.toFixed(2) : ''}</td>
+      <td class="num credit-amt">${row.credit ? row.credit.toFixed(2) : ''}</td>
+      <td class="num">${row.bal.toFixed(2)}</td>
+      <td class="crdr-${row.crdr}">${row.crdr}</td>
+      <td title="${escapeHtml(row._source)}">${escapeHtml(row._source)}</td>
+    `;
+    resultsBody.appendChild(tr);
+  });
+}
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+
+// ============================================================
+// Save location - File System Access API (Chrome/Edge). Once a folder
+// is chosen, both export buttons write straight into it with no further
+// prompt, until the user clicks "Change Folder" themselves.
+// ============================================================
+const supportsFSA = 'showDirectoryPicker' in window;
+if (!supportsFSA) {
+  savePathText.textContent = "Folder selection isn't supported in this browser (Chrome or Edge required) — exports will use your browser's normal Save/Download dialog instead.";
+  chooseFolderBtn.disabled = true;
+  folderStatusPill.className = 'pill warn';
+  folderStatusPill.innerHTML = '<span class="pill-dot"></span> Not supported';
+}
+
+chooseFolderBtn.addEventListener('click', async () => {
+  try {
+    const handle = await window.showDirectoryPicker();
+    saveDirHandle = handle;
+    savePathText.textContent = `Saving into folder: "${handle.name}"`;
+    savePathText.classList.add('set');
+    chooseFolderLabel.textContent = 'Change Folder';
+    folderStatusPill.className = 'pill ready';
+    folderStatusPill.innerHTML = '<span class="pill-dot"></span> Ready';
+  } catch (err) {
+    if (err.name !== 'AbortError') console.error(err);
+  }
+});
+
+// Writes a Blob to the chosen folder if one is set; otherwise falls back
+// to a normal browser download (which itself may prompt for a location,
+// depending on the user's browser settings).
+async function saveOutputFile(blob, filename) {
+  if (saveDirHandle) {
+    try {
+      // Re-confirm we still have write permission (browsers can revoke
+      // silently across reloads) before writing.
+      if ((await saveDirHandle.queryPermission({ mode: 'readwrite' })) !== 'granted') {
+        const perm = await saveDirHandle.requestPermission({ mode: 'readwrite' });
+        if (perm !== 'granted') throw new Error('permission not granted');
+      }
+      const fileHandle = await saveDirHandle.getFileHandle(filename, { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      setStatus(`Saved "${filename}" to your chosen folder.`, 'ok');
+      return;
+    } catch (err) {
+      console.error(err);
+      setStatus(`Couldn't save to the chosen folder (${err.message}) — using your browser's download instead.`, 'err');
+      // fall through to classic download
+    }
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+  if (!saveDirHandle) setStatus(`Downloaded "${filename}" via your browser's normal download prompt.`, 'ok');
+}
+
+// ============================================================
+// Export - CSV
+// ============================================================
+function buildAOA(rows) {
+  const header = ['Sl. No.', 'Transaction Date', 'Value Date', 'Chq / Ref No.', 'Description', 'Debit', 'Credit', 'Balance', 'Dr / Cr'];
+  const aoa = [header];
+  rows.forEach((row, idx) => {
+    aoa.push([
+      idx + 1,
+      row.txnDate ? fmtDate(row.txnDate) : '',
+      row.valDate ? fmtDate(row.valDate) : '',
+      row.chq || '',
+      row.desc,
+      row.debit || 0,
+      row.credit || 0,
+      row.bal || 0,
+      row.crdr,
+    ]);
+  });
+  return aoa;
+}
+
+downloadCsvBtn.addEventListener('click', async () => {
+  if (allRecords.length === 0) { setStatus('Nothing to export yet — import a statement first.', 'err'); return; }
+  setBtnLoading(downloadCsvBtn, true);
+  try {
+    const aoa = buildAOA(allRecords);
+    const csv = aoa.map(row => row.map(cell => {
+      const s = String(cell ?? '');
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }).join(',')).join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    await saveOutputFile(blob, `converted-statement-${dateStamp()}.csv`);
+  } finally {
+    setBtnLoading(downloadCsvBtn, false);
+  }
+});
+
+function dateStamp() {
+  const d = new Date();
+  return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}-${String(d.getHours()).padStart(2,'0')}${String(d.getMinutes()).padStart(2,'0')}`;
+}
+
+// ============================================================
+// Export - professional .xlsx via ExcelJS: real fonts, fills, borders,
+// number/date formats, colored Dr/Cr text, frozen+filterable header,
+// and columns auto-fit to their actual content width.
+// ============================================================
+const NAVY = 'FF0F1E33';
+const CREDIT_GREEN = 'FF1F7A5C';
+const DEBIT_RED = 'FFC0452E';
+const ZEBRA = 'FFF4F6F8';
+const HEADER_FONT = { name: 'Calibri', size: 11, bold: true, color: { argb: 'FFFFFFFF' } };
+const TITLE_FONT = { name: 'Calibri', size: 15, bold: true, color: { argb: NAVY } };
+const THIN_BORDER = { style: 'thin', color: { argb: 'FFD8DAD4' } };
+
+async function buildStyledWorkbook(rows, label) {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Bank Marco Statement Converter';
+  wb.created = new Date();
+  const ws = wb.addWorksheet('Statement', {
+    views: [{ state: 'frozen', ySplit: 4 }],
+    pageSetup: { orientation: 'landscape', fitToPage: true, fitToWidth: 1 },
+  });
+
+  const headers = ['Sl. No.', 'Transaction Date', 'Value Date', 'Chq / Ref No.', 'Description', 'Debit', 'Credit', 'Balance', 'Dr / Cr'];
+
+  ws.mergeCells(1, 1, 1, headers.length);
+  const titleCell = ws.getCell(1, 1);
+  titleCell.value = `Converted Bank Statement — ${label}`;
+  titleCell.font = TITLE_FONT;
+  titleCell.alignment = { vertical: 'middle' };
+  ws.getRow(1).height = 26;
+
+  ws.mergeCells(2, 1, 2, headers.length);
+  const subCell = ws.getCell(2, 1);
+  subCell.value = `Generated ${new Date().toLocaleString()}  ·  ${rows.length} transaction(s)`;
+  subCell.font = { name: 'Calibri', size: 9, italic: true, color: { argb: 'FF5B6472' } };
+
+  const headerRowIdx = 4;
+  const headerRow = ws.getRow(headerRowIdx);
+  headers.forEach((h, i) => {
+    const cell = headerRow.getCell(i + 1);
+    cell.value = h;
+    cell.font = HEADER_FONT;
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: NAVY } };
+    cell.alignment = { vertical: 'middle', horizontal: i >= 5 && i <= 7 ? 'right' : 'left' };
+    cell.border = { top: THIN_BORDER, bottom: THIN_BORDER, left: THIN_BORDER, right: THIN_BORDER };
+  });
+  headerRow.height = 20;
+
+  let totalDebit = 0, totalCredit = 0;
+  rows.forEach((row, idx) => {
+    const r = ws.getRow(headerRowIdx + 1 + idx);
+    const values = [
+      idx + 1,
+      row.txnDate || null,
+      row.valDate || null,
+      row.chq || '',
+      row.desc,
+      row.debit || 0,
+      row.credit || 0,
+      row.bal || 0,
+      row.crdr,
+    ];
+    values.forEach((v, i) => {
+      const cell = r.getCell(i + 1);
+      cell.value = v;
+      cell.border = { top: THIN_BORDER, bottom: THIN_BORDER, left: THIN_BORDER, right: THIN_BORDER };
+      if (idx % 2 === 1) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ZEBRA } };
+      if (i === 1 || i === 2) cell.numFmt = 'dd/mm/yyyy';
+      if (i === 5 || i === 6 || i === 7) { cell.numFmt = '#,##0.00'; cell.alignment = { horizontal: 'right' }; }
+      if (i === 8 && v === 'DR') cell.font = { color: { argb: DEBIT_RED }, bold: true };
+      if (i === 8 && v === 'CR') cell.font = { color: { argb: CREDIT_GREEN }, bold: true };
+      if (i === 5 && v) cell.font = { color: { argb: DEBIT_RED } };
+      if (i === 6 && v) cell.font = { color: { argb: CREDIT_GREEN } };
+    });
+    totalDebit += row.debit || 0;
+    totalCredit += row.credit || 0;
+  });
+
+  const totalsRowIdx = headerRowIdx + 1 + rows.length;
+  const totalsRow = ws.getRow(totalsRowIdx);
+  totalsRow.getCell(5).value = 'Total';
+  totalsRow.getCell(5).font = { bold: true };
+  totalsRow.getCell(6).value = totalDebit;
+  totalsRow.getCell(7).value = totalCredit;
+  [6, 7].forEach(i => {
+    const cell = totalsRow.getCell(i);
+    cell.numFmt = '#,##0.00';
+    cell.font = { bold: true };
+    cell.alignment = { horizontal: 'right' };
+    cell.border = { top: { style: 'double', color: { argb: NAVY } } };
+  });
+  totalsRow.getCell(5).border = { top: { style: 'double', color: { argb: NAVY } } };
+
+  headers.forEach((h, i) => {
+    let maxLen = h.length;
+    rows.forEach((row, idx) => {
+      const v = [idx + 1, fmtDate(row.txnDate), fmtDate(row.valDate), row.chq,
+        row.desc, row.debit ? row.debit.toFixed(2) : '', row.credit ? row.credit.toFixed(2) : '',
+        row.bal.toFixed(2), row.crdr][i];
+      const len = String(v ?? '').length;
+      if (len > maxLen) maxLen = len;
+    });
+    const cap = i === 4 ? 60 : 28;
+    ws.getColumn(i + 1).width = Math.min(maxLen + 3, cap);
+  });
+
+  ws.autoFilter = { from: { row: headerRowIdx, column: 1 }, to: { row: headerRowIdx, column: headers.length } };
+  return wb;
+}
+
+downloadXlsxBtn.addEventListener('click', async () => {
+  if (allRecords.length === 0) { setStatus('Nothing to export yet — import a statement first.', 'err'); return; }
+  setBtnLoading(downloadXlsxBtn, true);
+  try {
+    const label = allRecords.length && new Set(allRecords.map(r => r._formatLabel)).size === 1
+      ? allRecords[0]._formatLabel
+      : `${new Set(allRecords.map(r => r._formatLabel)).size} formats combined`;
+    const wb = await buildStyledWorkbook(allRecords, label);
+    const buffer = await wb.xlsx.writeBuffer();
+    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    await saveOutputFile(blob, `converted-statement-${dateStamp()}.xlsx`);
+  } catch (err) {
+    console.error(err);
+    setStatus('Could not build the Excel file: ' + err.message, 'err');
+  } finally {
+    setBtnLoading(downloadXlsxBtn, false);
+  }
+});
+
+// ============================================================
+// Resizable columns
+// ============================================================
+function setupColumnResize() {
+  const table = document.getElementById('resultsTable');
+  const cols = table.querySelectorAll('colgroup col');
+  const resizers = table.querySelectorAll('.col-resizer');
+  const minWidthPx = 40;
+
+  resizers.forEach((handle, i) => {
+    handle.addEventListener('mousedown', e => {
+      e.preventDefault();
+      handle.classList.add('active');
+      const tableWidth = table.getBoundingClientRect().width;
+      const startX = e.clientX;
+      const startWidthA = cols[i].getBoundingClientRect().width;
+      const startWidthB = cols[i + 1].getBoundingClientRect().width;
+      function toPercent(px) { return (px / tableWidth * 100).toFixed(3) + '%'; }
+      function onMove(ev) {
+        let delta = ev.clientX - startX;
+        let newA = startWidthA + delta;
+        let newB = startWidthB - delta;
+        if (newA < minWidthPx) { delta = minWidthPx - startWidthA; newA = minWidthPx; newB = startWidthB - delta; }
+        if (newB < minWidthPx) { delta = startWidthB - minWidthPx; newA = startWidthA + delta; newB = minWidthPx; }
+        cols[i].style.width = toPercent(newA);
+        cols[i + 1].style.width = toPercent(newB);
+      }
+      function onUp() {
+        handle.classList.remove('active');
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      }
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+    handle.addEventListener('touchstart', e => {
+      const touch = e.touches[0];
+      handle.classList.add('active');
+      const tableWidth = table.getBoundingClientRect().width;
+      const startX = touch.clientX;
+      const startWidthA = cols[i].getBoundingClientRect().width;
+      const startWidthB = cols[i + 1].getBoundingClientRect().width;
+      function toPercent(px) { return (px / tableWidth * 100).toFixed(3) + '%'; }
+      function onMove(ev) {
+        const t = ev.touches[0];
+        let delta = t.clientX - startX;
+        let newA = startWidthA + delta;
+        let newB = startWidthB - delta;
+        if (newA < minWidthPx) { delta = minWidthPx - startWidthA; newA = minWidthPx; newB = startWidthB - delta; }
+        if (newB < minWidthPx) { delta = startWidthB - minWidthPx; newA = startWidthA + delta; newB = minWidthPx; }
+        cols[i].style.width = toPercent(newA);
+        cols[i + 1].style.width = toPercent(newB);
+      }
+      function onEnd() {
+        handle.classList.remove('active');
+        document.removeEventListener('touchmove', onMove);
+        document.removeEventListener('touchend', onEnd);
+      }
+      document.addEventListener('touchmove', onMove, { passive: true });
+      document.addEventListener('touchend', onEnd);
+    }, { passive: true });
+  });
+}
+setupColumnResize();
+renderAll();
+</script>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Statement Converter — Bank Marco Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,500;8..60,600;8..60,700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap');
+
+  :root{
+    --navy:#0F1E33;
+    --navy-light:#1B3050;
+    --navy-glow:#2A4A78;
+    --teal:#1595A8;
+    --credit:#1F7A5C;
+    --debit:#C0452E;
+    --plum:#6B4FA0;
+    --paper:#FFFFFF;
+    --canvas:#EEF1F4;
+    --ink:#1B2430;
+    --ink-soft:#5B6472;
+    --rule:#DEE1E6;
+    --highlight:#FFF3D0;
+    --focus:#2E6FE0;
+    --shadow-sm:0 1px 2px rgba(15,30,51,0.06), 0 1px 1px rgba(15,30,51,0.04);
+    --shadow-md:0 8px 24px rgba(15,30,51,0.10), 0 2px 6px rgba(15,30,51,0.06);
+    --radius:12px;
+    --sidebar-w:236px;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:var(--canvas);
+    color:var(--ink);
+    font-family:'Inter',sans-serif;
+    line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:inherit;}
+  button{font-family:inherit;}
+
+  /* ---------------- App shell ---------------- */
+  .app-shell{display:flex; min-height:100vh;}
+
+  .sidebar{
+    width:var(--sidebar-w);
+    flex-shrink:0;
+    background:linear-gradient(185deg, var(--navy), #0A1524);
+    color:#D7DCE6;
+    display:flex;
+    flex-direction:column;
+    padding:1.3rem 1rem;
+    position:sticky;
+    top:0;
+    height:100vh;
+  }
+  .brand{
+    display:flex;
+    align-items:center;
+    gap:0.65rem;
+    padding:0.4rem 0.5rem 1.3rem;
+    border-bottom:1px solid rgba(255,255,255,0.08);
+    margin-bottom:1rem;
+  }
+  .brand-icon{
+    width:2.1rem; height:2.1rem;
+    border-radius:9px;
+    background:linear-gradient(135deg, var(--teal), var(--navy-glow));
+    display:flex; align-items:center; justify-content:center;
+    flex-shrink:0;
+  }
+  .brand-name{font-family:'Source Serif 4',serif; font-weight:700; font-size:0.98rem; color:#fff; line-height:1.2;}
+  .brand-sub{font-size:0.62rem; letter-spacing:0.06em; text-transform:uppercase; color:#7C8AA3; margin-top:0.15rem;}
+
+  .nav{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:0.15rem;}
+  .nav li a{
+    display:flex; align-items:center; gap:0.65rem;
+    padding:0.6rem 0.7rem;
+    border-radius:8px;
+    font-size:0.85rem;
+    font-weight:500;
+    color:#B7C0D1;
+    text-decoration:none;
+    cursor:pointer;
+    transition:background 0.12s ease, color 0.12s ease;
+  }
+  .nav li a:hover{background:rgba(255,255,255,0.06); color:#fff;}
+  .nav li a.active{background:linear-gradient(135deg, var(--teal), var(--navy-glow)); color:#fff; box-shadow:var(--shadow-sm);}
+  .nav li a svg{flex-shrink:0;}
+  .nav-spacer{flex:1;}
+  .sidebar-foot{font-size:0.65rem; color:#5C6A82; padding:0.6rem 0.5rem 0; border-top:1px solid rgba(255,255,255,0.08); margin-top:0.6rem;}
+
+  /* ---------------- Main ---------------- */
+  .main{flex:1; min-width:0; padding:1.6rem 2rem 3.5rem;}
+
+  .topbar{
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    gap:1rem;
+    margin-bottom:1.25rem;
+    flex-wrap:wrap;
+  }
+  .topbar h1{
+    font-family:'Source Serif 4',serif;
+    font-size:1.5rem;
+    font-weight:700;
+    margin:0 0 0.2rem;
+    display:flex; align-items:center; gap:0.5rem;
+  }
+  .topbar p{margin:0; color:var(--ink-soft); font-size:0.88rem;}
+  .pill{
+    display:inline-flex; align-items:center; gap:0.4rem;
+    padding:0.4rem 0.85rem;
+    border-radius:999px;
+    font-size:0.78rem;
+    font-weight:600;
+    white-space:nowrap;
+  }
+  .pill-dot{width:0.45rem; height:0.45rem; border-radius:50%; background:currentColor;}
+  .pill.ready{background:#E4F5EC; color:var(--credit);}
+  .pill.warn{background:#FDEFE6; color:#A65420;}
+  .pill.neutral{background:#EEF0F3; color:var(--ink-soft);}
+
+  .card{
+    background:var(--paper);
+    border:1px solid var(--rule);
+    border-radius:var(--radius);
+    box-shadow:var(--shadow-sm);
+  }
+
+  /* Save location bar */
+  .save-bar{
+    display:flex; align-items:center; gap:0.9rem; flex-wrap:wrap;
+    padding:0.9rem 1.1rem;
+    margin-bottom:1rem;
+  }
+  .save-bar .save-label{display:flex; align-items:center; gap:0.4rem; font-size:0.82rem; font-weight:600; color:var(--ink-soft); white-space:nowrap;}
+  .format-chip{
+    display:flex; align-items:center; gap:0.35rem;
+    padding:0.35rem 0.7rem;
+    border-radius:8px;
+    background:#EAF7EF;
+    color:var(--credit);
+    font-size:0.78rem; font-weight:600;
+    white-space:nowrap;
+  }
+  .save-path{
+    flex:1; min-width:180px;
+    font-family:'IBM Plex Mono',monospace;
+    font-size:0.8rem;
+    color:var(--ink-soft);
+    padding:0.5rem 0.8rem;
+    background:#F6F7F9;
+    border:1px dashed var(--rule);
+    border-radius:8px;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  .save-path.set{color:var(--ink); border-style:solid; background:#F2FAF6; border-color:#BFE3CE;}
+
+  /* Privacy banner */
+  .privacy-banner{
+    display:flex; align-items:center; gap:1rem;
+    background:linear-gradient(120deg, #0E6B4E, #159A6E);
+    color:#EFFBF4;
+    border-radius:var(--radius);
+    padding:1rem 1.3rem;
+    margin-bottom:1.25rem;
+    box-shadow:var(--shadow-md);
+    flex-wrap:wrap;
+  }
+  .privacy-banner .shield{
+    flex-shrink:0;
+    width:2.4rem; height:2.4rem;
+    border-radius:10px;
+    background:rgba(255,255,255,0.15);
+    display:flex; align-items:center; justify-content:center;
+  }
+  .privacy-banner .text{flex:1; min-width:240px;}
+  .privacy-banner .text strong.title{display:block; font-size:0.95rem; margin-bottom:0.25rem;}
+  .privacy-banner .text span{font-size:0.82rem; color:#D6F3E5; line-height:1.55;}
+  .privacy-banner .badge{
+    flex-shrink:0;
+    background:rgba(255,255,255,0.16);
+    padding:0.4rem 0.85rem;
+    border-radius:999px;
+    font-size:0.75rem;
+    font-weight:600;
+    white-space:nowrap;
+  }
+
+  /* Stat cards */
+  .stat-grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));
+    gap:0.9rem;
+    margin-bottom:1.25rem;
+  }
+  .stat-tile{
+    border-radius:var(--radius);
+    padding:1.15rem 1.25rem;
+    color:#fff;
+    box-shadow:var(--shadow-md);
+    position:relative;
+    overflow:hidden;
+    min-height:104px;
+  }
+  .stat-tile::after{
+    content:"";
+    position:absolute; right:-20px; bottom:-20px;
+    width:90px; height:90px;
+    border-radius:50%;
+    background:rgba(255,255,255,0.08);
+  }
+  .stat-tile.t-files{background:linear-gradient(150deg, #16324F, #0A1A2C);}
+  .stat-tile.t-txn{background:linear-gradient(150deg, #1B8A63, #0E5A40);}
+  .stat-tile.t-debit{background:linear-gradient(150deg, #C0452E, #8A2E1C);}
+  .stat-tile.t-credit{background:linear-gradient(150deg, #7A5AC0, #4E3680);}
+  .stat-tile .stat-icon{opacity:0.9; margin-bottom:0.6rem;}
+  .stat-tile .stat-label{font-size:0.7rem; text-transform:uppercase; letter-spacing:0.06em; opacity:0.85; font-weight:600;}
+  .stat-tile .stat-value{font-family:'IBM Plex Mono',monospace; font-size:1.7rem; font-weight:600; margin-top:0.2rem;}
+  .stat-tile .stat-foot{font-size:0.7rem; opacity:0.6; margin-top:0.35rem;}
+
+  /* Bank badges */
+  .bank-badges{
+    display:flex; flex-wrap:wrap; gap:0.7rem;
+    margin-bottom:1.25rem;
+  }
+  .bank-badge{
+    display:flex; align-items:center; gap:0.6rem;
+    background:var(--paper);
+    border:1px solid var(--rule);
+    border-radius:10px;
+    padding:0.65rem 1rem;
+    font-size:0.85rem;
+    font-weight:600;
+    box-shadow:var(--shadow-sm);
+  }
+  .bank-badge .swatch-dot{width:0.6rem; height:0.6rem; border-radius:50%;}
+  .bank-badge .count{
+    background:#EEF1F4; color:var(--ink-soft);
+    font-family:'IBM Plex Mono',monospace;
+    font-size:0.72rem; font-weight:600;
+    padding:0.1rem 0.5rem; border-radius:999px;
+  }
+  .bank-badges-empty{
+    font-size:0.83rem; color:var(--ink-soft);
+    padding:0.85rem 1rem;
+    border:1px dashed var(--rule);
+    border-radius:10px;
+    margin-bottom:1.25rem;
+    background:var(--paper);
+  }
+
+  /* Toolbar */
+  .toolbar{
+    display:flex; align-items:center; gap:1.4rem; flex-wrap:wrap;
+    padding:0.75rem 1.1rem;
+    margin-bottom:1rem;
+  }
+  .tb-group{display:flex; align-items:center; gap:0.55rem;}
+  .tb-group-label{
+    font-size:0.65rem; text-transform:uppercase; letter-spacing:0.07em;
+    color:var(--ink-soft); font-weight:700; margin-right:0.15rem;
+  }
+  .tb-divider{width:1px; height:1.6rem; background:var(--rule);}
+
+  button.tb-btn{
+    font-size:0.83rem; font-weight:600;
+    padding:0.55rem 0.95rem;
+    border-radius:8px;
+    border:1px solid transparent;
+    cursor:pointer;
+    display:inline-flex; align-items:center; gap:0.45rem;
+    transition:transform 0.1s ease, box-shadow 0.1s ease, filter 0.1s ease;
+    white-space:nowrap;
+  }
+  button.tb-btn:hover:not(:disabled){transform:translateY(-1px); filter:brightness(1.05);}
+  button.tb-btn:disabled{opacity:0.5; cursor:not-allowed;}
+  .tb-btn.primary{background:linear-gradient(135deg, var(--navy), var(--navy-glow)); color:#fff; box-shadow:var(--shadow-sm);}
+  .tb-btn.danger{background:#FBEDEA; color:var(--debit);}
+  .tb-btn.danger:hover:not(:disabled){background:#F8DFDA;}
+  .tb-btn.ghost{background:#F1F3F5; color:var(--ink);}
+  .tb-btn.excel{background:linear-gradient(135deg, #1F7A5C, #154F3C); color:#fff; box-shadow:var(--shadow-sm);}
+  .tb-btn.csv{background:#EAF3FB; color:#1D5A8C;}
+  select.tb-select{
+    font:inherit; font-size:0.83rem; font-weight:500;
+    padding:0.55rem 0.7rem;
+    border:1.5px solid var(--rule); border-radius:8px;
+    background:var(--paper); color:var(--ink);
+  }
+  .tb-btn .spinner{
+    width:0.85rem; height:0.85rem; border-radius:50%;
+    border:2px solid rgba(255,255,255,0.4); border-top-color:#fff;
+    animation:spin 0.7s linear infinite; display:none;
+  }
+  .tb-btn.loading .spinner{display:inline-block;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+
+  input#fileInput{display:none;}
+  .pending-file{
+    display:none; align-items:center; gap:0.6rem;
+    padding:0.55rem 0.9rem; margin:-0.4rem 0 1rem;
+    background:#F2FAF6; border:1px solid #BFE3CE; border-radius:9px;
+    font-size:0.82rem; color:var(--ink);
+  }
+  .pending-file.show{display:flex;}
+  .pending-file button{
+    margin-left:auto; background:none; border:none; color:var(--ink-soft);
+    cursor:pointer; font-size:0.9rem; padding:0.1rem 0.4rem;
+  }
+
+  .status{
+    margin:0 0 1rem;
+    font-size:0.85rem;
+    padding:0.7rem 0.9rem;
+    border-radius:9px;
+    border-left:3px solid var(--rule);
+    display:none;
+    align-items:center;
+    gap:0.5rem;
+    animation:fadeIn 0.2s ease;
+  }
+  .status.ok{border-color:var(--credit); background:#F1F8F5; color:#155C43;}
+  .status.err{border-color:var(--debit); background:#FBF0EC; color:#8A331E;}
+  .status.info{border-color:#8B93A0; background:#F4F5F7; color:var(--ink-soft);}
+  @keyframes fadeIn{from{opacity:0; transform:translateY(-3px);} to{opacity:1; transform:none;}}
+
+  /* Search + filter */
+  .search-bar{
+    display:flex; align-items:center; gap:0.9rem; flex-wrap:wrap;
+    padding:0.7rem 1.1rem;
+    margin-bottom:0.9rem;
+  }
+  .search-input-wrap{
+    flex:1; min-width:220px;
+    display:flex; align-items:center; gap:0.5rem;
+    padding:0.5rem 0.8rem;
+    background:#F6F7F9; border:1px solid var(--rule); border-radius:8px;
+  }
+  .search-input-wrap svg{flex-shrink:0; opacity:0.5;}
+  .search-input-wrap input{
+    border:none; background:none; outline:none; font:inherit; font-size:0.85rem;
+    width:100%; color:var(--ink);
+  }
+  .filter-pills{display:flex; gap:0.5rem; flex-wrap:wrap;}
+  .filter-pill{
+    display:flex; align-items:center; gap:0.4rem;
+    padding:0.4rem 0.8rem;
+    border-radius:999px;
+    font-size:0.78rem; font-weight:600;
+    background:#EEF0F3; color:var(--ink-soft);
+    border:1.5px solid transparent;
+    cursor:pointer;
+    white-space:nowrap;
+  }
+  .filter-pill .fp-count{
+    background:rgba(255,255,255,0.6);
+    padding:0.05rem 0.4rem; border-radius:999px; font-family:'IBM Plex Mono',monospace;
+  }
+  .filter-pill.active{background:var(--navy); color:#fff;}
+  .filter-pill.active .fp-count{background:rgba(255,255,255,0.2);}
+  .filter-pill[data-f="debit"]:not(.active){color:var(--debit);}
+  .filter-pill[data-f="credit"]:not(.active){color:var(--credit);}
+  .filter-pill[data-f="incomplete"]:not(.active){color:#A65420;}
+
+  /* Table */
+  .table-card{padding:0; overflow:hidden;}
+  .table-wrap{overflow-x:auto; overflow-y:auto; max-height:60vh;}
+  table{border-collapse:collapse; width:100%; font-size:0.83rem; table-layout:fixed;}
+  thead th{
+    position:sticky; top:0;
+    background:linear-gradient(180deg, var(--navy-light), var(--navy));
+    color:#fff; font-weight:600; text-align:left;
+    padding:0.65rem 0.9rem 0.65rem 0.65rem;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    user-select:none;
+  }
+  thead th.num{text-align:right;}
+  tbody td{
+    padding:0.55rem 0.65rem;
+    border-bottom:1px solid var(--rule);
+    font-family:'IBM Plex Mono',monospace;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  tbody td.desc{font-family:'Inter',sans-serif; white-space:normal; word-break:break-word;}
+  tbody td.num{text-align:right;}
+  tbody tr{transition:background 0.1s ease;}
+  tbody tr:nth-child(even){background:#FAFAF8;}
+  tbody tr:hover{background:#EEF4FB;}
+  tbody tr.incomplete{background:var(--highlight) !important;}
+  td.debit-amt{color:var(--debit);}
+  td.credit-amt{color:var(--credit);}
+  td.crdr-DR{color:var(--debit); font-weight:600;}
+  td.crdr-CR{color:var(--credit); font-weight:600;}
+  .col-resizer{position:absolute; top:0; right:0; width:8px; height:100%; cursor:col-resize; z-index:3; touch-action:none;}
+  .col-resizer:hover, .col-resizer.active{background:rgba(255,255,255,0.35);}
+  th{position:relative;}
+
+  .empty-state{
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    padding:3.5rem 1.5rem;
+    color:var(--ink-soft);
+    text-align:center;
+  }
+  .empty-state svg{margin-bottom:1rem; opacity:0.7;}
+  .empty-state .es-title{font-size:1.05rem; font-weight:700; color:var(--ink); margin-bottom:0.3rem;}
+  .empty-state .es-sub{font-size:0.85rem;}
+
+  .legend{margin:0.7rem 1.1rem 0; font-size:0.78rem; color:var(--ink-soft); display:flex; align-items:center; gap:0.5rem;}
+  .legend .swatch{width:0.85rem; height:0.85rem; border-radius:3px; background:var(--highlight); border:1px solid #E2C878; display:inline-block;}
+
+  details.help-panel{
+    margin-top:1.5rem;
+    background:var(--paper);
+    border:1px solid var(--rule);
+    border-radius:var(--radius);
+    padding:1.1rem 1.3rem;
+    font-size:0.83rem;
+    color:var(--ink-soft);
+  }
+  details.help-panel summary{cursor:pointer; font-weight:700; color:var(--ink); font-size:0.9rem;}
+  details.help-panel ul{padding-left:1.2rem; margin:0.9rem 0 0;}
+  details.help-panel li{margin-bottom:0.5rem;}
+  details.help-panel .about-line{margin-top:1rem; padding-top:1rem; border-top:1px solid var(--rule);}
+
+  @media (max-width:880px){
+    .sidebar{display:none;}
+    .main{padding:1.25rem 1rem 3rem;}
+  }
+</style>
+</head>
+<body>
+
+<div class="app-shell">
+
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 10l9-6 9 6M5 10v9h14v-9M9 19v-6h6v6" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div>
+        <div class="brand-name">Bank Marco</div>
+        <div class="brand-sub">Statement Converter</div>
+      </div>
+    </div>
+    <ul class="nav">
+      <li><a href="#dashboard" class="active" data-section="dashboard">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="3" y="3" width="7" height="9" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="14" y="3" width="7" height="5" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="14" y="12" width="7" height="9" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="3" y="16" width="7" height="5" rx="1.5" stroke="currentColor" stroke-width="1.8"/></svg>
+        Dashboard
+      </a></li>
+      <li><a href="#importSection" data-section="import">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Import Files
+      </a></li>
+      <li><a href="#recordsSection" data-section="records">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4 6h16M4 12h16M4 18h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        Records
+      </a></li>
+      <li><a href="#exportSection" data-section="export">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Export
+      </a></li>
+      <li><a href="#helpSection" data-section="help">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/><path d="M9.5 9a2.5 2.5 0 015 .2c0 1.6-2.2 1.8-2.4 3.3M12 17h.01" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        Help / Formats
+      </a></li>
+    </ul>
+    <div class="nav-spacer"></div>
+    <div class="sidebar-foot">Runs 100% in your browser.<br>No files ever leave this device.</div>
+  </aside>
+
+  <main class="main">
+
+    <div class="topbar" id="dashboard">
+      <div>
+        <h1>Dashboard</h1>
+        <p>Import statements, review the combined ledger, and export a clean Bank Marco-format file.</p>
+      </div>
+      <div id="topStatusPill" class="pill neutral"><span class="pill-dot"></span> Idle</div>
+    </div>
+
+    <!-- Save location -->
+    <div class="card save-bar" id="settingsSection">
+      <div class="save-label">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="#5B6472" stroke-width="1.8"/></svg>
+        Save Location:
+      </div>
+      <div class="format-chip">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M20 6L9 17l-5-5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Excel &amp; CSV
+      </div>
+      <div class="save-path" id="savePathText">No folder chosen yet — exports will use your browser's normal download prompt.</div>
+      <button class="tb-btn primary" id="chooseFolderBtn">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="white" stroke-width="2"/></svg>
+        <span id="chooseFolderLabel">Choose Folder</span>
+      </button>
+      <div class="pill neutral" id="folderStatusPill"><span class="pill-dot"></span> Not set</div>
+    </div>
+
+    <!-- Privacy banner -->
+    <div class="privacy-banner">
+      <div class="shield">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6l7-3z" stroke="white" stroke-width="2" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="text">
+        <strong class="title">Your Data Stays on Your Computer — Always</strong>
+        <span><strong>100% local processing:</strong> every file is parsed entirely in this browser tab. Nothing is ever uploaded to a server or stored in the cloud — your statements stay private on your own device. When you export, you choose exactly where the file is saved.</span>
+      </div>
+      <div class="badge">Zero Data Upload</div>
+    </div>
+
+    <!-- Stat cards -->
+    <div class="stat-grid">
+      <div class="stat-tile t-files">
+        <div class="stat-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M7 3h7l5 5v13a1 1 0 01-1 1H7a1 1 0 01-1-1V4a1 1 0 011-1z" stroke="white" stroke-width="1.8" stroke-linejoin="round"/></svg></div>
+        <div class="stat-label">Files Imported</div>
+        <div class="stat-value" id="statFiles">0</div>
+        <div class="stat-foot">—</div>
+      </div>
+      <div class="stat-tile t-txn">
+        <div class="stat-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4 19V9m6 10V4m6 15v-7" stroke="white" stroke-width="2" stroke-linecap="round"/></svg></div>
+        <div class="stat-label">Total Transactions</div>
+        <div class="stat-value" id="statTxn">0</div>
+        <div class="stat-foot">—</div>
+      </div>
+      <div class="stat-tile t-debit">
+        <div class="stat-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 5v14m-6-6l6 6 6-6" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <div class="stat-label">Total Debit</div>
+        <div class="stat-value" id="statDebit">0.00</div>
+        <div class="stat-foot">—</div>
+      </div>
+      <div class="stat-tile t-credit">
+        <div class="stat-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 19V5m6 6l-6-6-6 6" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <div class="stat-label">Total Credit</div>
+        <div class="stat-value" id="statCredit">0.00</div>
+        <div class="stat-foot">—</div>
+      </div>
+    </div>
+
+    <!-- Bank badges -->
+    <div id="bankBadges"></div>
+
+    <!-- Import / toolbar -->
+    <div class="card toolbar" id="importSection">
+      <div class="tb-group">
+        <span class="tb-group-label">File</span>
+        <button class="tb-btn primary" id="importBtn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Import
+        </button>
+        <button class="tb-btn danger" id="clearBtn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4 7h16M9 7V5a1 1 0 011-1h4a1 1 0 011 1v2m2 0v12a2 2 0 01-2 2H8a2 2 0 01-2-2V7h12z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Clear All
+        </button>
+        <input type="file" id="fileInput" accept=".xls,.xlsx,.csv">
+      </div>
+      <div class="tb-divider"></div>
+      <div class="tb-group">
+        <span class="tb-group-label">Parse</span>
+        <select id="formatSelect" class="tb-select">
+          <option value="auto">Auto-detect</option>
+          <option value="icici_quick">ICICI — Quick Statement</option>
+          <option value="icici_saving">ICICI — Detailed Statement</option>
+          <option value="kotak">Kotak Mahindra</option>
+          <option value="canara">Canara Bank</option>
+          <option value="hdfc">HDFC Bank</option>
+          <option value="axis">Axis Bank</option>
+          <option value="pnb">PNB</option>
+          <option value="sbi">SBI (State Bank of India)</option>
+        </select>
+        <button class="tb-btn primary" id="convertBtn" disabled>
+          <span class="spinner"></span>
+          <span class="btn-label">Convert &amp; Add</span>
+        </button>
+      </div>
+      <div class="tb-divider" id="exportSection"></div>
+      <div class="tb-group">
+        <span class="tb-group-label">Export</span>
+        <button class="tb-btn excel" id="downloadXlsx">
+          <span class="spinner"></span>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span class="btn-label">Excel</span>
+        </button>
+        <button class="tb-btn csv" id="downloadCsv">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14" stroke="#1D5A8C" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          CSV
+        </button>
+      </div>
+    </div>
+
+    <div class="pending-file" id="pendingFile">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M7 3h7l5 5v13a1 1 0 01-1 1H7a1 1 0 01-1-1V4a1 1 0 011-1z" stroke="#1B2430" stroke-width="1.6"/></svg>
+      <span id="pendingFileName"></span>
+      <button id="pendingFileClear" title="Remove">✕</button>
+    </div>
+
+    <div id="status" class="status"></div>
+
+    <!-- Search + filters -->
+    <div class="card search-bar">
+      <div class="search-input-wrap">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="11" cy="11" r="7" stroke="#5B6472" stroke-width="2"/><path d="M21 21l-4.3-4.3" stroke="#5B6472" stroke-width="2" stroke-linecap="round"/></svg>
+        <input type="text" id="searchInput" placeholder="Search description or Chq / Ref No…">
+      </div>
+      <div class="filter-pills" id="filterPills">
+        <div class="filter-pill active" data-f="all">All <span class="fp-count" id="fpAll">0</span></div>
+        <div class="filter-pill" data-f="debit">Debit <span class="fp-count" id="fpDebit">0</span></div>
+        <div class="filter-pill" data-f="credit">Credit <span class="fp-count" id="fpCredit">0</span></div>
+        <div class="filter-pill" data-f="incomplete">Incomplete <span class="fp-count" id="fpIncomplete">0</span></div>
+      </div>
+    </div>
+
+    <!-- Records table -->
+    <div class="card table-card" id="recordsSection">
+      <div class="table-wrap" id="tableWrap">
+        <table id="resultsTable">
+          <colgroup>
+            <col style="width:4%"><col style="width:10%"><col style="width:10%"><col style="width:11%">
+            <col style="width:26%"><col style="width:9%"><col style="width:9%"><col style="width:11%">
+            <col style="width:5%"><col style="width:5%">
+          </colgroup>
+          <thead>
+            <tr>
+              <th>Sl. No.<span class="col-resizer"></span></th>
+              <th>Transaction Date<span class="col-resizer"></span></th>
+              <th>Value Date<span class="col-resizer"></span></th>
+              <th>Chq / Ref No.<span class="col-resizer"></span></th>
+              <th>Description<span class="col-resizer"></span></th>
+              <th class="num">Debit<span class="col-resizer"></span></th>
+              <th class="num">Credit<span class="col-resizer"></span></th>
+              <th class="num">Balance<span class="col-resizer"></span></th>
+              <th>Dr / Cr<span class="col-resizer"></span></th>
+              <th>Source</th>
+            </tr>
+          </thead>
+          <tbody id="resultsBody"></tbody>
+        </table>
+      </div>
+      <div class="empty-state" id="emptyState">
+        <svg width="52" height="52" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 7l3-3h5l2 2h8v11a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" fill="#F5C563"/></svg>
+        <div class="es-title">No statements imported yet</div>
+        <div class="es-sub">Click <strong>Import</strong> above, choose a file, then <strong>Convert &amp; Add</strong>.</div>
+      </div>
+      <div class="legend" id="tableLegend" style="display:none;">
+        <span class="swatch"></span> Row is missing a date or description even after the Chq/Ref No. fallback — worth checking manually.
+      </div>
+      <div style="height:0.9rem;"></div>
+    </div>
+
+    <details class="help-panel" id="helpSection">
+      <summary>Supported formats &amp; how this works</summary>
+      <ul>
+        <li><strong>ICICI — Quick Statement</strong>: the "OpTransactionHistoryUX3" export. One combined Amount column with a Cr/Dr sign column.</li>
+        <li><strong>ICICI — Detailed Statement</strong>: the "OpTransactionHistory" export. Header sits in column B; Withdrawal/Deposit already split; Value Date precedes Transaction Date.</li>
+        <li><strong>Kotak Mahindra</strong>: CSV with two "Dr / Cr" columns — only the first (next to Amount) is used.</li>
+        <li><strong>Canara Bank</strong>: CSV with no serial number column (generated here), a letterhead preamble, timestamped Txn Date and a "03 Aug 2026"-style Value Date.</li>
+        <li><strong>HDFC Bank</strong>: two-digit years, asterisk divider rows, and a trailing "Opening Balance" row that's correctly excluded.</li>
+        <li><strong>Axis Bank</strong>: only one date column (used for both Transaction and Value Date); stops at the "Charge breakup" section.</li>
+        <li><strong>PNB</strong>: only one date column; Balance carries a trailing "Cr."/"Dr." suffix that's stripped.</li>
+        <li><strong>SBI</strong>: only one date column; "Details" cells often contain embedded line breaks that get collapsed into one clean line; Ref No/Cheque No. is usually blank, so the LEFT(4)-of-Description fallback applies here too.</li>
+      </ul>
+      <div class="about-line">Every parser, and the Excel/CSV file generation, runs entirely in this browser tab — nothing is uploaded anywhere. The "Choose Folder" option (Chrome/Edge only) uses your browser's native File System Access permission so exports save straight into that folder without asking again, until you click "Change Folder" yourself.</div>
+    </details>
+
+  </main>
+</div>
+
+<script>
+function excelSerialToDate(n) {
+  const ms = Math.round(n) * 86400000;
+  return new Date(Date.UTC(1899, 11, 30) + ms);
+}
+function normalizeDateOnly(d) {
+  if (!d || isNaN(d.getTime())) return null;
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+}
+function isSaneStatementYear(d) {
+  if (!d) return false;
+  const y = d.getUTCFullYear();
+  return y >= 1990 && y <= 2100;
+}
+function parseDMY(v) {
+  if (v === null || v === undefined || v === '') return null;
+  if (v instanceof Date) return normalizeDateOnly(v);
+  if (typeof v === 'number') {
+    const d = normalizeDateOnly(excelSerialToDate(v));
+    return isSaneStatementYear(d) ? d : null;
+  }
+  const s = String(v).trim().split(' ')[0];
+  const parts = s.split('/');
+  if (parts.length !== 3) return null;
+  const d = parseInt(parts[0], 10), m = parseInt(parts[1], 10), y = parseInt(parts[2], 10);
+  if (!d || !m || !y) return null;
+  return new Date(Date.UTC(y, m - 1, d));
+}
+function parseDMYDash(v) {
+  if (v === null || v === undefined || v === '') return null;
+  if (v instanceof Date) return normalizeDateOnly(v);
+  if (typeof v === 'number') {
+    const d = normalizeDateOnly(excelSerialToDate(v));
+    return isSaneStatementYear(d) ? d : null;
+  }
+  const s = String(v).trim().split(' ')[0];
+  const parts = s.split('-');
+  if (parts.length !== 3) return null;
+  const d = parseInt(parts[0], 10), m = parseInt(parts[1], 10), y = parseInt(parts[2], 10);
+  if (!d || !m || !y) return null;
+  return new Date(Date.UTC(y, m - 1, d));
+}
+function parseDDMMYY2digit(v) {
+  if (v === null || v === undefined || v === '') return null;
+  if (v instanceof Date) return normalizeDateOnly(v);
+  if (typeof v === 'number') {
+    const d = normalizeDateOnly(excelSerialToDate(v));
+    return isSaneStatementYear(d) ? d : null;
+  }
+  const s = String(v).trim();
+  const parts = s.split('/');
+  if (parts.length !== 3) return null;
+  let d = parseInt(parts[0], 10), m = parseInt(parts[1], 10), y = parseInt(parts[2], 10);
+  if (!d || !m || y === undefined || isNaN(y)) return null;
+  if (y < 100) y += 2000;
+  return new Date(Date.UTC(y, m - 1, d));
+}
+const MONTHS = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+function parseMonName(v) {
+  if (v === null || v === undefined || v === '') return null;
+  if (v instanceof Date) return normalizeDateOnly(v);
+  if (typeof v === 'number') {
+    const d = normalizeDateOnly(excelSerialToDate(v));
+    return isSaneStatementYear(d) ? d : null;
+  }
+  const s = String(v).trim();
+  const parts = s.split(' ').filter(Boolean);
+  if (parts.length !== 3) return null;
+  const d = parseInt(parts[0], 10);
+  const mi = MONTHS.indexOf(parts[1].slice(0, 3).toLowerCase());
+  const y = parseInt(parts[2], 10);
+  if (!d || mi === -1 || !y) return null;
+  return new Date(Date.UTC(y, mi, d));
+}
+function cleanNumber(v) {
+  if (v === null || v === undefined) return 0;
+  if (typeof v === 'number') return v;
+  let s = String(v).replace(/,/g, '').replace(/"/g, '').trim();
+  if (s === '' || s === '-' || s === '.') return 0;
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+function cleanBalance(v) {
+  if (typeof v === 'number') return v;
+  let s = String(v ?? '').trim();
+  s = s.replace(/\s*(Cr\.?|Dr\.?|CR\.?|DR\.?)\s*$/i, '');
+  return cleanNumber(s);
+}
+function isPureNumber(v) {
+  if (v === null || v === undefined || v === '') return false;
+  if (typeof v === 'number') return !isNaN(v);
+  return /^-?\d+(\.\d+)?$/.test(String(v).trim());
+}
+function fmtDate(d) {
+  if (!d) return '';
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const yyyy = d.getUTCFullYear();
+  return `${dd}/${mm}/${yyyy}`;
+}
+function findHeaderRow(grid, mustContain, maxScan) {
+  maxScan = maxScan || 60;
+  for (let r = 0; r < Math.min(grid.length, maxScan); r++) {
+    const rowVals = (grid[r] || []).map(v => String(v == null ? '' : v).trim());
+    if (mustContain.every(needle => rowVals.includes(needle))) return r;
+  }
+  return -1;
+}
+function colMapByHeader(grid, headerRow) {
+  const map = {};
+  (grid[headerRow] || []).forEach((h, i) => {
+    const key = String(h == null ? '' : h).trim();
+    if (key && !(key in map)) map[key] = i;
+  });
+  return map;
+}
+
+function parseICICIQuick(grid) {
+  const hr = findHeaderRow(grid, ['No.', 'Description']);
+  if (hr === -1) return null;
+  const c = colMapByHeader(grid, hr);
+  const need = ['No.', 'Txn Posted Date', 'Value Date', 'ChequeNo.', 'Description', 'Cr/Dr', 'Transaction Amount(INR)', 'Available Balance(INR)'];
+  for (const k of need) if (!(k in c)) return null;
+  const out = [];
+  let sl = 1;
+  for (let r = hr + 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    if (!isPureNumber(row[c['No.']])) continue;
+    const txnDate = parseDMY(row[c['Txn Posted Date']]);
+    const valDate = parseDMY(row[c['Value Date']]);
+    let chq = String(row[c['ChequeNo.']] ?? '').trim();
+    if (chq === '-') chq = '';
+    const desc = String(row[c['Description']] ?? '').trim();
+    const crdr = String(row[c['Cr/Dr']] ?? '').trim().toUpperCase();
+    const amt = cleanNumber(row[c['Transaction Amount(INR)']]);
+    const bal = cleanNumber(row[c['Available Balance(INR)']]);
+    out.push({ sl: sl++, txnDate, valDate, chq, desc,
+      debit: crdr === 'DR' ? amt : 0, credit: crdr === 'CR' ? amt : 0, bal, crdr });
+  }
+  return out;
+}
+
+function parseICICISaving(grid) {
+  const hr = findHeaderRow(grid, ['S No.', 'Transaction Remarks']);
+  if (hr === -1) return null;
+  const c = colMapByHeader(grid, hr);
+  const need = ['S No.', 'Value Date', 'Transaction Date', 'Cheque Number', 'Transaction Remarks', 'Withdrawal Amount(INR)', 'Deposit Amount(INR)', 'Balance(INR)'];
+  for (const k of need) if (!(k in c)) return null;
+  const out = [];
+  let sl = 1;
+  for (let r = hr + 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    if (!isPureNumber(row[c['S No.']])) continue;
+    const txnDate = parseDMY(row[c['Transaction Date']]);
+    const valDate = parseDMY(row[c['Value Date']]);
+    let chq = String(row[c['Cheque Number']] ?? '').trim();
+    if (chq === '-') chq = '';
+    const desc = String(row[c['Transaction Remarks']] ?? '').trim();
+    const withdrawal = cleanNumber(row[c['Withdrawal Amount(INR)']]);
+    const deposit = cleanNumber(row[c['Deposit Amount(INR)']]);
+    const bal = cleanNumber(row[c['Balance(INR)']]);
+    const crdr = withdrawal > 0 ? 'DR' : (deposit > 0 ? 'CR' : '');
+    out.push({ sl: sl++, txnDate, valDate, chq, desc, debit: withdrawal, credit: deposit, bal, crdr });
+  }
+  return out;
+}
+
+function parseKotak(grid) {
+  let hr = -1;
+  for (let r = 0; r < Math.min(grid.length, 60); r++) {
+    if (String((grid[r] || [])[0] ?? '').trim() === 'Sl. No.') { hr = r; break; }
+  }
+  if (hr === -1) return null;
+  const headers = grid[hr].map(h => String(h ?? '').trim());
+  const norm = headers.map(h => h.replace(/\s+/g, ''));
+  const colSl = norm.indexOf('Sl.No.');
+  const colTxnDate = norm.indexOf('TransactionDate');
+  const colValDate = norm.indexOf('ValueDate');
+  const colDesc = norm.indexOf('Description');
+  const colChq = norm.findIndex(n => n.includes('Chq') || n.includes('Ref'));
+  const colBal = norm.indexOf('Balance');
+  const colCrDr = norm.indexOf('Dr/Cr');
+  const colAmt = norm.indexOf('Amount');      // older Kotak export: combined Amount + sign
+  const colDebit = norm.indexOf('Debit');     // newer Kotak export: split Debit/Credit
+  const colCredit = norm.indexOf('Credit');
+
+  const hasCombinedAmount = colAmt !== -1;
+  const hasSplitDebitCredit = colDebit !== -1 && colCredit !== -1;
+  if (colSl === -1 || colDesc === -1 || colBal === -1 || (!hasCombinedAmount && !hasSplitDebitCredit)) return null;
+
+  const out = [];
+  let sl = 1;
+  for (let r = hr + 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    if (!isPureNumber(row[colSl])) continue; // skips the "Closing balance" footer row
+    const txnDate = parseDMY(row[colTxnDate]);
+    const valDate = parseDMY(row[colValDate]);
+    let chq = String(row[colChq] ?? '').trim();
+    if (chq === '-') chq = '';
+    const desc = String(row[colDesc] ?? '').trim();
+    const bal = cleanNumber(row[colBal]);
+
+    let debit, credit, crdr;
+    if (hasCombinedAmount) {
+      // Older layout: the Dr/Cr column right next to Amount IS the transaction's sign.
+      crdr = String(row[colCrDr] ?? '').trim().toUpperCase();
+      const amt = cleanNumber(row[colAmt]);
+      debit = crdr === 'DR' ? amt : 0;
+      credit = crdr === 'CR' ? amt : 0;
+    } else {
+      // Newer layout: Debit/Credit are already split. The one Dr/Cr column
+      // here sits right after Balance and reflects the BALANCE's sign
+      // (almost always "CR" for a healthy account) - not the individual
+      // transaction's direction. Always derive Dr/Cr from the amounts instead.
+      debit = cleanNumber(row[colDebit]);
+      credit = cleanNumber(row[colCredit]);
+      crdr = debit > 0 ? 'DR' : (credit > 0 ? 'CR' : '');
+    }
+    out.push({ sl: sl++, txnDate, valDate, chq, desc, debit, credit, bal, crdr });
+  }
+  return out;
+}
+
+function parseCanara(grid) {
+  const hr = findHeaderRow(grid, ['Txn Date', 'Description']);
+  if (hr === -1) return null;
+  const c = colMapByHeader(grid, hr);
+  const need = ['Txn Date', 'Value Date', 'Description', 'Debit', 'Credit', 'Balance'];
+  for (const k of need) if (!(k in c)) return null;
+  const out = [];
+  let sl = 1;
+  for (let r = hr + 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    const txnText = row[c['Txn Date']];
+    if (txnText === undefined || txnText === null || String(txnText).trim() === '') continue;
+    const txnDate = parseDMYDash(txnText);
+    if (!txnDate) continue;
+    const valDate = parseMonName(row[c['Value Date']]);
+    let chq = 'Cheque No.' in c ? String(row[c['Cheque No.']] ?? '').trim() : '';
+    if (chq === '-') chq = '';
+    const desc = String(row[c['Description']] ?? '').trim();
+    const debit = cleanNumber(row[c['Debit']]);
+    const credit = cleanNumber(row[c['Credit']]);
+    const bal = cleanNumber(row[c['Balance']]);
+    const crdr = debit > 0 ? 'DR' : (credit > 0 ? 'CR' : '');
+    out.push({ sl: sl++, txnDate, valDate, chq, desc, debit, credit, bal, crdr });
+  }
+  return out;
+}
+
+function isAsteriskRow(row) {
+  let sawAny = false;
+  for (const v of row) {
+    const s = String(v ?? '').trim();
+    if (s) { sawAny = true; if (!/^\*+$/.test(s)) return false; }
+  }
+  return sawAny;
+}
+function parseHDFC(grid) {
+  const hr = findHeaderRow(grid, ['Narration']);
+  if (hr === -1) return null;
+  const hasWithdrawal = (grid[hr] || []).some(v => String(v ?? '').includes('Withdrawal'));
+  if (!hasWithdrawal) return null;
+  const headers = grid[hr].map(h => String(h ?? '').trim());
+  const c = {};
+  headers.forEach((h, i) => { if (h) c[h] = i; });
+  const dateCol = c['Date'];
+  const narrCol = c['Narration'];
+  const chqCol = c['Chq./Ref.No.'];
+  const valCol = c['Value Dt'] !== undefined ? c['Value Dt'] : c['Value Dt.'];
+  const wdCol = c['Withdrawal Amt.'];
+  const depCol = c['Deposit Amt.'];
+  const balCol = c['Closing Balance'];
+  if ([dateCol, narrCol, wdCol, depCol, balCol].some(i => i === undefined)) return null;
+  const out = [];
+  let sl = 1;
+  for (let r = hr + 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    const dateVal = row[dateCol];
+    if (dateVal === undefined || dateVal === null || String(dateVal).trim() === '') continue;
+    if (isAsteriskRow(row)) continue;
+    const txnDate = parseDDMMYY2digit(dateVal);
+    if (!txnDate) continue;
+    const valDate = parseDDMMYY2digit(row[valCol]);
+    let chq = chqCol !== undefined ? String(row[chqCol] ?? '').trim() : '';
+    if (chq === '-') chq = '';
+    const desc = String(row[narrCol] ?? '').trim();
+    const withdrawal = cleanNumber(row[wdCol]);
+    const deposit = cleanNumber(row[depCol]);
+    const bal = cleanNumber(row[balCol]);
+    const crdr = withdrawal > 0 ? 'DR' : (deposit > 0 ? 'CR' : '');
+    out.push({ sl: sl++, txnDate, valDate, chq, desc, debit: withdrawal, credit: deposit, bal, crdr });
+  }
+  return out;
+}
+
+function parseAxis(grid) {
+  let hr = -1;
+  for (let r = 0; r < Math.min(grid.length, 60); r++) {
+    const trimmed = (grid[r] || []).map(v => String(v ?? '').trim());
+    if (trimmed.includes('SRL NO') && trimmed.includes('PARTICULARS')) { hr = r; break; }
+  }
+  if (hr === -1) return null;
+  const headers = grid[hr].map(h => String(h ?? '').trim());
+  const c = {};
+  headers.forEach((h, i) => { if (h) c[h] = i; });
+  const need = ['SRL NO', 'Tran Date', 'PARTICULARS', 'DR', 'CR', 'BAL'];
+  for (const k of need) if (!(k in c)) return null;
+  const out = [];
+  let sl = 1;
+  for (let r = hr + 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    const srlText = String(row[c['SRL NO']] ?? '').trim();
+    if (!isPureNumber(srlText)) break;
+    const txnDate = parseDMYDash(row[c['Tran Date']]);
+    let chq = 'CHQNO' in c ? String(row[c['CHQNO']] ?? '').trim() : '';
+    if (chq === '-') chq = '';
+    const desc = String(row[c['PARTICULARS']] ?? '').trim();
+    const debit = cleanNumber(row[c['DR']]);
+    const credit = cleanNumber(row[c['CR']]);
+    const bal = cleanNumber(row[c['BAL']]);
+    const crdr = debit > 0 ? 'DR' : (credit > 0 ? 'CR' : '');
+    out.push({ sl: sl++, txnDate, valDate: txnDate, chq, desc, debit, credit, bal, crdr });
+  }
+  return out;
+}
+
+function parsePNB(grid) {
+  const hr = findHeaderRow(grid, ['Txn No.', 'Description']);
+  if (hr === -1) return null;
+  const c = colMapByHeader(grid, hr);
+  const need = ['Txn No.', 'Txn Date', 'Description', 'Dr Amount', 'Cr Amount', 'Balance'];
+  for (const k of need) if (!(k in c)) return null;
+  const out = [];
+  let sl = 1;
+  for (let r = hr + 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    const txnNoText = String(row[c['Txn No.']] ?? '').trim();
+    if (!txnNoText) break;
+    const txnDate = parseDMY(row[c['Txn Date']]);
+    if (!txnDate) continue;
+    let chq = 'Cheque No.' in c ? String(row[c['Cheque No.']] ?? '').trim() : '';
+    if (chq === '-') chq = '';
+    const desc = String(row[c['Description']] ?? '').trim();
+    const debit = cleanNumber(row[c['Dr Amount']]);
+    const credit = cleanNumber(row[c['Cr Amount']]);
+    const bal = cleanBalance(row[c['Balance']]);
+    const crdr = debit > 0 ? 'DR' : (credit > 0 ? 'CR' : '');
+    out.push({ sl: sl++, txnDate, valDate: txnDate, chq, desc, debit, credit, bal, crdr });
+  }
+  return out;
+}
+
+// SBI (State Bank of India): Date, Details, Ref No/Cheque No, Debit,
+// Credit, Balance. No serial column (generated here); only ONE date
+// column (used for both Transaction and Value Date); "Details" cells
+// routinely contain embedded line breaks from Excel's cell-wrap, which
+// are collapsed into a single clean line; "Ref No/Cheque No" is usually
+// blank, left as-is here since fillChqFromDescription() applies the same
+// LEFT(4) fallback used for every other bank. A letterhead/account-summary
+// preamble precedes the header, and a "Statement Summary" section follows
+// the transaction list - both are skipped by stopping at the first row
+// whose Date cell doesn't parse as a genuine date.
+function parseSBI(grid) {
+  const hr = findHeaderRow(grid, ['Date', 'Details']);
+  if (hr === -1) return null;
+  const c = colMapByHeader(grid, hr);
+  const need = ['Date', 'Details', 'Debit', 'Credit'];
+  for (const k of need) if (!(k in c)) return null;
+  const out = [];
+  let sl = 1;
+  for (let r = hr + 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    const txnDate = parseDMY(row[c['Date']]);
+    if (!txnDate) break; // hit the blank row / "Statement Summary" section - stop
+    let chq = 'Ref No/Cheque No' in c ? String(row[c['Ref No/Cheque No']] ?? '').trim() : '';
+    if (chq === '-') chq = '';
+    const desc = cleanMultilineText(row[c['Details']]);
+    const debit = cleanNumber(row[c['Debit']]);
+    const credit = cleanNumber(row[c['Credit']]);
+    const bal = 'Balance' in c ? cleanNumber(row[c['Balance']]) : 0;
+    const crdr = debit > 0 ? 'DR' : (credit > 0 ? 'CR' : '');
+    out.push({ sl: sl++, txnDate, valDate: txnDate, chq, desc, debit, credit, bal, crdr });
+  }
+  return out;
+}
+
+// Collapses embedded line breaks / tabs / repeated whitespace from a
+// wrapped Excel cell (SBI's "Details" column) into one clean line.
+function cleanMultilineText(v) {
+  return String(v ?? '').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// When a bank doesn't give a real cheque/reference number, the Description
+// usually starts with the transaction mode instead (e.g. "NEFT/ICIN209505...",
+// "IMPS/...", "RTGS/...", "UPI/..."). Rather than leaving Chq / Ref No.
+// blank, fill it with the first 4 characters of the Description so every
+// row has *something* there.
+function fillChqFromDescription(rows) {
+  rows.forEach(row => {
+    if (!row.chq) {
+      const left4 = (row.desc || '').trim().slice(0, 4);
+      if (left4) row.chq = left4;
+    }
+  });
+  return rows;
+}
+
+const PARSERS = [
+  { id: 'icici_quick', label: 'ICICI — Quick Statement', fn: parseICICIQuick },
+  { id: 'icici_saving', label: 'ICICI — Detailed Statement (Saving)', fn: parseICICISaving },
+  { id: 'kotak', label: 'Kotak Mahindra', fn: parseKotak },
+  { id: 'canara', label: 'Canara Bank', fn: parseCanara },
+  { id: 'hdfc', label: 'HDFC Bank', fn: parseHDFC },
+  { id: 'axis', label: 'Axis Bank', fn: parseAxis },
+  { id: 'pnb', label: 'PNB (Punjab National Bank)', fn: parsePNB },
+  { id: 'sbi', label: 'SBI (State Bank of India)', fn: parseSBI },
+];
+
+
+// ============================================================
+// Sidebar nav - smooth scroll + active state (single-page dashboard,
+// sections below are all on this one page)
+// ============================================================
+document.querySelectorAll('.nav a').forEach(link => {
+  link.addEventListener('click', e => {
+    e.preventDefault();
+    document.querySelectorAll('.nav a').forEach(a => a.classList.remove('active'));
+    link.classList.add('active');
+    const target = document.querySelector(link.getAttribute('href'));
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+
+// ============================================================
+// Element refs
+// ============================================================
+const fileInput = document.getElementById('fileInput');
+const importBtn = document.getElementById('importBtn');
+const clearBtn = document.getElementById('clearBtn');
+const pendingFile = document.getElementById('pendingFile');
+const pendingFileName = document.getElementById('pendingFileName');
+const pendingFileClear = document.getElementById('pendingFileClear');
+const formatSelect = document.getElementById('formatSelect');
+const convertBtn = document.getElementById('convertBtn');
+const statusEl = document.getElementById('status');
+const topStatusPill = document.getElementById('topStatusPill');
+
+const searchInput = document.getElementById('searchInput');
+const filterPills = document.getElementById('filterPills');
+
+const resultsBody = document.getElementById('resultsBody');
+const tableWrap = document.getElementById('tableWrap');
+const emptyState = document.getElementById('emptyState');
+const tableLegend = document.getElementById('tableLegend');
+
+const statFiles = document.getElementById('statFiles');
+const statTxn = document.getElementById('statTxn');
+const statDebit = document.getElementById('statDebit');
+const statCredit = document.getElementById('statCredit');
+const bankBadgesEl = document.getElementById('bankBadges');
+
+const chooseFolderBtn = document.getElementById('chooseFolderBtn');
+const chooseFolderLabel = document.getElementById('chooseFolderLabel');
+const savePathText = document.getElementById('savePathText');
+const folderStatusPill = document.getElementById('folderStatusPill');
+
+const downloadXlsxBtn = document.getElementById('downloadXlsx');
+const downloadCsvBtn = document.getElementById('downloadCsv');
+
+// ============================================================
+// State
+// ============================================================
+let currentFile = null;
+let allRecords = [];      // accumulated across every successful Convert & Add
+let currentFilter = 'all';
+let saveDirHandle = null; // File System Access API directory handle, once chosen
+
+const BANK_COLORS = {
+  'icici_quick': '#1F7A5C', 'icici_saving': '#2E6FE0', 'kotak': '#C0452E',
+  'canara': '#6B4FA0', 'hdfc': '#B8860B', 'axis': '#1595A8', 'pnb': '#A6395A',
+  'sbi': '#2E7D32',
+};
+
+function setStatus(msg, kind) {
+  if (!msg) { statusEl.style.display = 'none'; return; }
+  const icon = kind === 'ok' ? '✓' : kind === 'err' ? '⚠' : '…';
+  statusEl.innerHTML = `<strong>${icon}</strong> ${msg}`;
+  statusEl.className = 'status' + (kind ? ' ' + kind : '');
+  statusEl.style.display = 'flex';
+}
+
+function setTopPill(kind, text) {
+  topStatusPill.className = 'pill ' + kind;
+  topStatusPill.innerHTML = `<span class="pill-dot"></span> ${text}`;
+}
+
+function setBtnLoading(btn, loading) {
+  btn.classList.toggle('loading', loading);
+  btn.disabled = loading;
+}
+
+// ============================================================
+// File selection (Import button + native input; no drag/drop chrome
+// needed now that Import lives in the toolbar, but the input itself
+// still accepts a click-triggered pick)
+// ============================================================
+importBtn.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => pickFile(fileInput.files[0]));
+pendingFileClear.addEventListener('click', () => { fileInput.value = ''; pickFile(null); });
+
+function pickFile(file) {
+  currentFile = file || null;
+  convertBtn.disabled = !currentFile;
+  if (currentFile) {
+    pendingFile.classList.add('show');
+    pendingFileName.textContent = `${currentFile.name} (${(currentFile.size / 1024).toFixed(1)} KB)`;
+  } else {
+    pendingFile.classList.remove('show');
+  }
+}
+
+function gridFromSheet(workbook) {
+  const ws = workbook.Sheets[workbook.SheetNames[0]];
+  return XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: true });
+}
+
+function readFileAsGrid(file) {
+  return new Promise((resolve, reject) => {
+    const ext = file.name.split('.').pop().toLowerCase();
+    if (ext === 'csv') {
+      const reader = new FileReader();
+      reader.onload = e => resolve(Papa.parse(e.target.result, { skipEmptyLines: false }).data);
+      reader.onerror = reject;
+      reader.readAsText(file);
+    } else {
+      const reader = new FileReader();
+      reader.onload = e => {
+        try { resolve(gridFromSheet(XLSX.read(e.target.result, { type: 'array', cellDates: true }))); }
+        catch (err) { reject(err); }
+      };
+      reader.onerror = reject;
+      reader.readAsArrayBuffer(file);
+    }
+  });
+}
+
+// ============================================================
+// Convert & Add - parses the picked file and appends to the running
+// records list (tagged with source file name + detected format)
+// ============================================================
+convertBtn.addEventListener('click', async () => {
+  if (!currentFile) return;
+  setStatus('Reading file…', 'info');
+  setTopPill('neutral', 'Working…');
+  setBtnLoading(convertBtn, true);
+  try {
+    const grid = await readFileAsGrid(currentFile);
+    const choice = formatSelect.value;
+    let rows = null, matchedId = null, matchedLabel = null;
+
+    if (choice === 'auto') {
+      for (const p of PARSERS) {
+        const r = p.fn(grid);
+        if (r && r.length > 0) { rows = r; matchedId = p.id; matchedLabel = p.label; break; }
+      }
+      if (!rows) {
+        setStatus('Could not recognise this file as any supported format. Try picking the bank manually from the dropdown.', 'err');
+        setTopPill('warn', 'Not recognised');
+        return;
+      }
+    } else {
+      const p = PARSERS.find(p => p.id === choice);
+      rows = p.fn(grid);
+      matchedId = p.id; matchedLabel = p.label;
+      if (!rows || rows.length === 0) {
+        setStatus(`Could not find "${matchedLabel}" columns in this file. Double-check the format, or try Auto-detect.`, 'err');
+        setTopPill('warn', 'Not recognised');
+        return;
+      }
+    }
+
+    rows = fillChqFromDescription(rows);
+    rows.forEach(r => { r._source = currentFile.name; r._formatId = matchedId; r._formatLabel = matchedLabel; });
+    allRecords = allRecords.concat(rows);
+
+    setStatus(`Detected: ${matchedLabel} — ${rows.length} transaction(s) added (${allRecords.length} total).`, 'ok');
+    setTopPill('ready', 'Ready');
+    fileInput.value = '';
+    pickFile(null);
+    renderAll();
+  } catch (err) {
+    console.error(err);
+    setStatus('Something went wrong reading that file: ' + err.message, 'err');
+    setTopPill('warn', 'Error');
+  } finally {
+    setBtnLoading(convertBtn, false);
+  }
+});
+
+clearBtn.addEventListener('click', () => {
+  if (allRecords.length === 0) return;
+  if (!confirm(`Remove all ${allRecords.length} imported transaction(s)? This can't be undone.`)) return;
+  allRecords = [];
+  setStatus('All records cleared.', 'info');
+  setTopPill('neutral', 'Idle');
+  renderAll();
+});
+
+// ============================================================
+// Search + filter
+// ============================================================
+filterPills.addEventListener('click', e => {
+  const pill = e.target.closest('.filter-pill');
+  if (!pill) return;
+  currentFilter = pill.dataset.f;
+  document.querySelectorAll('.filter-pill').forEach(p => p.classList.toggle('active', p === pill));
+  renderTable();
+});
+searchInput.addEventListener('input', () => renderTable());
+
+function matchesFilter(row, filter) {
+  if (filter === 'debit') return row.debit > 0;
+  if (filter === 'credit') return row.credit > 0;
+  if (filter === 'incomplete') return !row.txnDate || !row.valDate || !row.desc;
+  return true;
+}
+
+function getFilteredRecords() {
+  const term = searchInput.value.trim().toLowerCase();
+  return allRecords.filter(row => {
+    if (!matchesFilter(row, currentFilter)) return false;
+    if (!term) return true;
+    return (row.desc || '').toLowerCase().includes(term) || (row.chq || '').toLowerCase().includes(term);
+  });
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function renderAll() {
+  renderStats();
+  renderBankBadges();
+  renderTable();
+}
+
+function renderStats() {
+  const files = new Set(allRecords.map(r => r._source)).size;
+  const totalDebit = allRecords.reduce((s, r) => s + (r.debit || 0), 0);
+  const totalCredit = allRecords.reduce((s, r) => s + (r.credit || 0), 0);
+  statFiles.textContent = files;
+  statTxn.textContent = allRecords.length;
+  statDebit.textContent = totalDebit.toFixed(2);
+  statCredit.textContent = totalCredit.toFixed(2);
+}
+
+function renderBankBadges() {
+  if (allRecords.length === 0) {
+    bankBadgesEl.innerHTML = `<div class="bank-badges-empty">Import a statement to see per-bank totals here.</div>`;
+    return;
+  }
+  const counts = {};
+  allRecords.forEach(r => { counts[r._formatLabel] = (counts[r._formatLabel] || 0) + 1; });
+  const html = Object.entries(counts).map(([label, n]) => {
+    const id = allRecords.find(r => r._formatLabel === label)._formatId;
+    const color = BANK_COLORS[id] || '#5B6472';
+    return `<div class="bank-badge"><span class="swatch-dot" style="background:${color};"></span>${escapeHtml(label)} <span class="count">${n}</span></div>`;
+  }).join('');
+  bankBadgesEl.innerHTML = `<div class="bank-badges">${html}</div>`;
+}
+
+function renderTable() {
+  const filtered = getFilteredRecords();
+
+  // filter pill counts (against full record set, independent of search box)
+  document.getElementById('fpAll').textContent = allRecords.length;
+  document.getElementById('fpDebit').textContent = allRecords.filter(r => matchesFilter(r, 'debit')).length;
+  document.getElementById('fpCredit').textContent = allRecords.filter(r => matchesFilter(r, 'credit')).length;
+  document.getElementById('fpIncomplete').textContent = allRecords.filter(r => matchesFilter(r, 'incomplete')).length;
+
+  resultsBody.innerHTML = '';
+
+  if (allRecords.length === 0) {
+    tableWrap.style.display = 'none';
+    emptyState.style.display = 'flex';
+    tableLegend.style.display = 'none';
+    return;
+  }
+  tableWrap.style.display = 'block';
+  emptyState.style.display = 'none';
+  tableLegend.style.display = 'flex';
+
+  filtered.forEach((row, idx) => {
+    const incomplete = !row.txnDate || !row.valDate || !row.desc;
+    const tr = document.createElement('tr');
+    if (incomplete) tr.className = 'incomplete';
+    tr.innerHTML = `
+      <td>${idx + 1}</td>
+      <td>${fmtDate(row.txnDate)}</td>
+      <td>${fmtDate(row.valDate)}</td>
+      <td>${row.chq || ''}</td>
+      <td class="desc">${escapeHtml(row.desc)}</td>
+      <td class="num debit-amt">${row.debit ? row.debit.toFixed(2) : ''}</td>
+      <td class="num credit-amt">${row.credit ? row.credit.toFixed(2) : ''}</td>
+      <td class="num">${row.bal.toFixed(2)}</td>
+      <td class="crdr-${row.crdr}">${row.crdr}</td>
+      <td title="${escapeHtml(row._source)}">${escapeHtml(row._source)}</td>
+    `;
+    resultsBody.appendChild(tr);
+  });
+}
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+
+// ============================================================
+// Save location - File System Access API (Chrome/Edge). Once a folder
+// is chosen, both export buttons write straight into it with no further
+// prompt, until the user clicks "Change Folder" themselves.
+// ============================================================
+const supportsFSA = 'showDirectoryPicker' in window;
+if (!supportsFSA) {
+  savePathText.textContent = "Folder selection isn't supported in this browser (Chrome or Edge required) — exports will use your browser's normal Save/Download dialog instead.";
+  chooseFolderBtn.disabled = true;
+  folderStatusPill.className = 'pill warn';
+  folderStatusPill.innerHTML = '<span class="pill-dot"></span> Not supported';
+}
+
+chooseFolderBtn.addEventListener('click', async () => {
+  try {
+    const handle = await window.showDirectoryPicker();
+    saveDirHandle = handle;
+    savePathText.textContent = `Saving into folder: "${handle.name}"`;
+    savePathText.classList.add('set');
+    chooseFolderLabel.textContent = 'Change Folder';
+    folderStatusPill.className = 'pill ready';
+    folderStatusPill.innerHTML = '<span class="pill-dot"></span> Ready';
+  } catch (err) {
+    if (err.name !== 'AbortError') console.error(err);
+  }
+});
+
+// Writes a Blob to the chosen folder if one is set; otherwise falls back
+// to a normal browser download (which itself may prompt for a location,
+// depending on the user's browser settings).
+async function saveOutputFile(blob, filename) {
+  if (saveDirHandle) {
+    try {
+      // Re-confirm we still have write permission (browsers can revoke
+      // silently across reloads) before writing.
+      if ((await saveDirHandle.queryPermission({ mode: 'readwrite' })) !== 'granted') {
+        const perm = await saveDirHandle.requestPermission({ mode: 'readwrite' });
+        if (perm !== 'granted') throw new Error('permission not granted');
+      }
+      const fileHandle = await saveDirHandle.getFileHandle(filename, { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      setStatus(`Saved "${filename}" to your chosen folder.`, 'ok');
+      return;
+    } catch (err) {
+      console.error(err);
+      setStatus(`Couldn't save to the chosen folder (${err.message}) — using your browser's download instead.`, 'err');
+      // fall through to classic download
+    }
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+  if (!saveDirHandle) setStatus(`Downloaded "${filename}" via your browser's normal download prompt.`, 'ok');
+}
+
+// ============================================================
+// Export - CSV
+// ============================================================
+function buildAOA(rows) {
+  const header = ['Sl. No.', 'Transaction Date', 'Value Date', 'Chq / Ref No.', 'Description', 'Debit', 'Credit', 'Balance', 'Dr / Cr'];
+  const aoa = [header];
+  rows.forEach((row, idx) => {
+    aoa.push([
+      idx + 1,
+      row.txnDate ? fmtDate(row.txnDate) : '',
+      row.valDate ? fmtDate(row.valDate) : '',
+      row.chq || '',
+      row.desc,
+      row.debit || 0,
+      row.credit || 0,
+      row.bal || 0,
+      row.crdr,
+    ]);
+  });
+  return aoa;
+}
+
+downloadCsvBtn.addEventListener('click', async () => {
+  if (allRecords.length === 0) { setStatus('Nothing to export yet — import a statement first.', 'err'); return; }
+  setBtnLoading(downloadCsvBtn, true);
+  try {
+    const aoa = buildAOA(allRecords);
+    const csv = aoa.map(row => row.map(cell => {
+      const s = String(cell ?? '');
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }).join(',')).join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    await saveOutputFile(blob, `converted-statement-${dateStamp()}.csv`);
+  } finally {
+    setBtnLoading(downloadCsvBtn, false);
+  }
+});
+
+function dateStamp() {
+  const d = new Date();
+  return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}-${String(d.getHours()).padStart(2,'0')}${String(d.getMinutes()).padStart(2,'0')}`;
+}
+
+// ============================================================
+// Export - professional .xlsx via ExcelJS: real fonts, fills, borders,
+// number/date formats, colored Dr/Cr text, frozen+filterable header,
+// and columns auto-fit to their actual content width.
+// ============================================================
+const NAVY = 'FF0F1E33';
+const CREDIT_GREEN = 'FF1F7A5C';
+const DEBIT_RED = 'FFC0452E';
+const ZEBRA = 'FFF4F6F8';
+const HEADER_FONT = { name: 'Calibri', size: 11, bold: true, color: { argb: 'FFFFFFFF' } };
+const TITLE_FONT = { name: 'Calibri', size: 15, bold: true, color: { argb: NAVY } };
+const THIN_BORDER = { style: 'thin', color: { argb: 'FFD8DAD4' } };
+
+async function buildStyledWorkbook(rows, label) {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Bank Marco Statement Converter';
+  wb.created = new Date();
+  const ws = wb.addWorksheet('Statement', {
+    views: [{ state: 'frozen', ySplit: 4 }],
+    pageSetup: { orientation: 'landscape', fitToPage: true, fitToWidth: 1 },
+  });
+
+  const headers = ['Sl. No.', 'Transaction Date', 'Value Date', 'Chq / Ref No.', 'Description', 'Debit', 'Credit', 'Balance', 'Dr / Cr'];
+
+  ws.mergeCells(1, 1, 1, headers.length);
+  const titleCell = ws.getCell(1, 1);
+  titleCell.value = `Converted Bank Statement — ${label}`;
+  titleCell.font = TITLE_FONT;
+  titleCell.alignment = { vertical: 'middle' };
+  ws.getRow(1).height = 26;
+
+  ws.mergeCells(2, 1, 2, headers.length);
+  const subCell = ws.getCell(2, 1);
+  subCell.value = `Generated ${new Date().toLocaleString()}  ·  ${rows.length} transaction(s)`;
+  subCell.font = { name: 'Calibri', size: 9, italic: true, color: { argb: 'FF5B6472' } };
+
+  const headerRowIdx = 4;
+  const headerRow = ws.getRow(headerRowIdx);
+  headers.forEach((h, i) => {
+    const cell = headerRow.getCell(i + 1);
+    cell.value = h;
+    cell.font = HEADER_FONT;
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: NAVY } };
+    cell.alignment = { vertical: 'middle', horizontal: i >= 5 && i <= 7 ? 'right' : 'left' };
+    cell.border = { top: THIN_BORDER, bottom: THIN_BORDER, left: THIN_BORDER, right: THIN_BORDER };
+  });
+  headerRow.height = 20;
+
+  let totalDebit = 0, totalCredit = 0;
+  rows.forEach((row, idx) => {
+    const r = ws.getRow(headerRowIdx + 1 + idx);
+    const values = [
+      idx + 1,
+      row.txnDate || null,
+      row.valDate || null,
+      row.chq || '',
+      row.desc,
+      row.debit || 0,
+      row.credit || 0,
+      row.bal || 0,
+      row.crdr,
+    ];
+    values.forEach((v, i) => {
+      const cell = r.getCell(i + 1);
+      cell.value = v;
+      cell.border = { top: THIN_BORDER, bottom: THIN_BORDER, left: THIN_BORDER, right: THIN_BORDER };
+      if (idx % 2 === 1) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ZEBRA } };
+      if (i === 1 || i === 2) cell.numFmt = 'dd/mm/yyyy';
+      if (i === 5 || i === 6 || i === 7) { cell.numFmt = '#,##0.00'; cell.alignment = { horizontal: 'right' }; }
+      if (i === 8 && v === 'DR') cell.font = { color: { argb: DEBIT_RED }, bold: true };
+      if (i === 8 && v === 'CR') cell.font = { color: { argb: CREDIT_GREEN }, bold: true };
+      if (i === 5 && v) cell.font = { color: { argb: DEBIT_RED } };
+      if (i === 6 && v) cell.font = { color: { argb: CREDIT_GREEN } };
+    });
+    totalDebit += row.debit || 0;
+    totalCredit += row.credit || 0;
+  });
+
+  const totalsRowIdx = headerRowIdx + 1 + rows.length;
+  const totalsRow = ws.getRow(totalsRowIdx);
+  totalsRow.getCell(5).value = 'Total';
+  totalsRow.getCell(5).font = { bold: true };
+  totalsRow.getCell(6).value = totalDebit;
+  totalsRow.getCell(7).value = totalCredit;
+  [6, 7].forEach(i => {
+    const cell = totalsRow.getCell(i);
+    cell.numFmt = '#,##0.00';
+    cell.font = { bold: true };
+    cell.alignment = { horizontal: 'right' };
+    cell.border = { top: { style: 'double', color: { argb: NAVY } } };
+  });
+  totalsRow.getCell(5).border = { top: { style: 'double', color: { argb: NAVY } } };
+
+  headers.forEach((h, i) => {
+    let maxLen = h.length;
+    rows.forEach((row, idx) => {
+      const v = [idx + 1, fmtDate(row.txnDate), fmtDate(row.valDate), row.chq,
+        row.desc, row.debit ? row.debit.toFixed(2) : '', row.credit ? row.credit.toFixed(2) : '',
+        row.bal.toFixed(2), row.crdr][i];
+      const len = String(v ?? '').length;
+      if (len > maxLen) maxLen = len;
+    });
+    const cap = i === 4 ? 60 : 28;
+    ws.getColumn(i + 1).width = Math.min(maxLen + 3, cap);
+  });
+
+  ws.autoFilter = { from: { row: headerRowIdx, column: 1 }, to: { row: headerRowIdx, column: headers.length } };
+  return wb;
+}
+
+downloadXlsxBtn.addEventListener('click', async () => {
+  if (allRecords.length === 0) { setStatus('Nothing to export yet — import a statement first.', 'err'); return; }
+  setBtnLoading(downloadXlsxBtn, true);
+  try {
+    const label = allRecords.length && new Set(allRecords.map(r => r._formatLabel)).size === 1
+      ? allRecords[0]._formatLabel
+      : `${new Set(allRecords.map(r => r._formatLabel)).size} formats combined`;
+    const wb = await buildStyledWorkbook(allRecords, label);
+    const buffer = await wb.xlsx.writeBuffer();
+    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    await saveOutputFile(blob, `converted-statement-${dateStamp()}.xlsx`);
+  } catch (err) {
+    console.error(err);
+    setStatus('Could not build the Excel file: ' + err.message, 'err');
+  } finally {
+    setBtnLoading(downloadXlsxBtn, false);
+  }
+});
+
+// ============================================================
+// Resizable columns
+// ============================================================
+function setupColumnResize() {
+  const table = document.getElementById('resultsTable');
+  const cols = table.querySelectorAll('colgroup col');
+  const resizers = table.querySelectorAll('.col-resizer');
+  const minWidthPx = 40;
+
+  resizers.forEach((handle, i) => {
+    handle.addEventListener('mousedown', e => {
+      e.preventDefault();
+      handle.classList.add('active');
+      const tableWidth = table.getBoundingClientRect().width;
+      const startX = e.clientX;
+      const startWidthA = cols[i].getBoundingClientRect().width;
+      const startWidthB = cols[i + 1].getBoundingClientRect().width;
+      function toPercent(px) { return (px / tableWidth * 100).toFixed(3) + '%'; }
+      function onMove(ev) {
+        let delta = ev.clientX - startX;
+        let newA = startWidthA + delta;
+        let newB = startWidthB - delta;
+        if (newA < minWidthPx) { delta = minWidthPx - startWidthA; newA = minWidthPx; newB = startWidthB - delta; }
+        if (newB < minWidthPx) { delta = startWidthB - minWidthPx; newA = startWidthA + delta; newB = minWidthPx; }
+        cols[i].style.width = toPercent(newA);
+        cols[i + 1].style.width = toPercent(newB);
+      }
+      function onUp() {
+        handle.classList.remove('active');
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      }
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+    handle.addEventListener('touchstart', e => {
+      const touch = e.touches[0];
+      handle.classList.add('active');
+      const tableWidth = table.getBoundingClientRect().width;
+      const startX = touch.clientX;
+      const startWidthA = cols[i].getBoundingClientRect().width;
+      const startWidthB = cols[i + 1].getBoundingClientRect().width;
+      function toPercent(px) { return (px / tableWidth * 100).toFixed(3) + '%'; }
+      function onMove(ev) {
+        const t = ev.touches[0];
+        let delta = t.clientX - startX;
+        let newA = startWidthA + delta;
+        let newB = startWidthB - delta;
+        if (newA < minWidthPx) { delta = minWidthPx - startWidthA; newA = minWidthPx; newB = startWidthB - delta; }
+        if (newB < minWidthPx) { delta = startWidthB - minWidthPx; newA = startWidthA + delta; newB = minWidthPx; }
+        cols[i].style.width = toPercent(newA);
+        cols[i + 1].style.width = toPercent(newB);
+      }
+      function onEnd() {
+        handle.classList.remove('active');
+        document.removeEventListener('touchmove', onMove);
+        document.removeEventListener('touchend', onEnd);
+      }
+      document.addEventListener('touchmove', onMove, { passive: true });
+      document.addEventListener('touchend', onEnd);
+    }, { passive: true });
+  });
+}
+setupColumnResize();
+renderAll();
+</script>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Statement Converter — Bank Marco Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,500;8..60,600;8..60,700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap');
+
+  :root{
+    --navy:#0F1E33;
+    --navy-light:#1B3050;
+    --navy-glow:#2A4A78;
+    --teal:#1595A8;
+    --credit:#1F7A5C;
+    --debit:#C0452E;
+    --plum:#6B4FA0;
+    --paper:#FFFFFF;
+    --canvas:#EEF1F4;
+    --ink:#1B2430;
+    --ink-soft:#5B6472;
+    --rule:#DEE1E6;
+    --highlight:#FFF3D0;
+    --focus:#2E6FE0;
+    --shadow-sm:0 1px 2px rgba(15,30,51,0.06), 0 1px 1px rgba(15,30,51,0.04);
+    --shadow-md:0 8px 24px rgba(15,30,51,0.10), 0 2px 6px rgba(15,30,51,0.06);
+    --radius:12px;
+    --sidebar-w:236px;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:var(--canvas);
+    color:var(--ink);
+    font-family:'Inter',sans-serif;
+    line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:inherit;}
+  button{font-family:inherit;}
+
+  /* ---------------- App shell ---------------- */
+  .app-shell{display:flex; min-height:100vh;}
+
+  .sidebar{
+    width:var(--sidebar-w);
+    flex-shrink:0;
+    background:linear-gradient(185deg, var(--navy), #0A1524);
+    color:#D7DCE6;
+    display:flex;
+    flex-direction:column;
+    padding:1.3rem 1rem;
+    position:sticky;
+    top:0;
+    height:100vh;
+  }
+  .brand{
+    display:flex;
+    align-items:center;
+    gap:0.65rem;
+    padding:0.4rem 0.5rem 1.3rem;
+    border-bottom:1px solid rgba(255,255,255,0.08);
+    margin-bottom:1rem;
+  }
+  .brand-icon{
+    width:2.1rem; height:2.1rem;
+    border-radius:9px;
+    background:linear-gradient(135deg, var(--teal), var(--navy-glow));
+    display:flex; align-items:center; justify-content:center;
+    flex-shrink:0;
+  }
+  .brand-name{font-family:'Source Serif 4',serif; font-weight:700; font-size:0.98rem; color:#fff; line-height:1.2;}
+  .brand-sub{font-size:0.62rem; letter-spacing:0.06em; text-transform:uppercase; color:#7C8AA3; margin-top:0.15rem;}
+
+  .nav{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:0.15rem;}
+  .nav li a{
+    display:flex; align-items:center; gap:0.65rem;
+    padding:0.6rem 0.7rem;
+    border-radius:8px;
+    font-size:0.85rem;
+    font-weight:500;
+    color:#B7C0D1;
+    text-decoration:none;
+    cursor:pointer;
+    transition:background 0.12s ease, color 0.12s ease;
+  }
+  .nav li a:hover{background:rgba(255,255,255,0.06); color:#fff;}
+  .nav li a.active{background:linear-gradient(135deg, var(--teal), var(--navy-glow)); color:#fff; box-shadow:var(--shadow-sm);}
+  .nav li a svg{flex-shrink:0;}
+  .nav-spacer{flex:1;}
+  .sidebar-foot{font-size:0.65rem; color:#5C6A82; padding:0.6rem 0.5rem 0; border-top:1px solid rgba(255,255,255,0.08); margin-top:0.6rem;}
+
+  /* ---------------- Main ---------------- */
+  .main{flex:1; min-width:0; padding:1.6rem 2rem 3.5rem;}
+
+  .topbar{
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    gap:1rem;
+    margin-bottom:1.25rem;
+    flex-wrap:wrap;
+  }
+  .topbar h1{
+    font-family:'Source Serif 4',serif;
+    font-size:1.5rem;
+    font-weight:700;
+    margin:0 0 0.2rem;
+    display:flex; align-items:center; gap:0.5rem;
+  }
+  .topbar p{margin:0; color:var(--ink-soft); font-size:0.88rem;}
+  .pill{
+    display:inline-flex; align-items:center; gap:0.4rem;
+    padding:0.4rem 0.85rem;
+    border-radius:999px;
+    font-size:0.78rem;
+    font-weight:600;
+    white-space:nowrap;
+  }
+  .pill-dot{width:0.45rem; height:0.45rem; border-radius:50%; background:currentColor;}
+  .pill.ready{background:#E4F5EC; color:var(--credit);}
+  .pill.warn{background:#FDEFE6; color:#A65420;}
+  .pill.neutral{background:#EEF0F3; color:var(--ink-soft);}
+
+  .card{
+    background:var(--paper);
+    border:1px solid var(--rule);
+    border-radius:var(--radius);
+    box-shadow:var(--shadow-sm);
+  }
+
+  /* Save location bar */
+  .save-bar{
+    display:flex; align-items:center; gap:0.9rem; flex-wrap:wrap;
+    padding:0.9rem 1.1rem;
+    margin-bottom:1rem;
+  }
+  .save-bar .save-label{display:flex; align-items:center; gap:0.4rem; font-size:0.82rem; font-weight:600; color:var(--ink-soft); white-space:nowrap;}
+  .format-chip{
+    display:flex; align-items:center; gap:0.35rem;
+    padding:0.35rem 0.7rem;
+    border-radius:8px;
+    background:#EAF7EF;
+    color:var(--credit);
+    font-size:0.78rem; font-weight:600;
+    white-space:nowrap;
+  }
+  .save-path{
+    flex:1; min-width:180px;
+    font-family:'IBM Plex Mono',monospace;
+    font-size:0.8rem;
+    color:var(--ink-soft);
+    padding:0.5rem 0.8rem;
+    background:#F6F7F9;
+    border:1px dashed var(--rule);
+    border-radius:8px;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  .save-path.set{color:var(--ink); border-style:solid; background:#F2FAF6; border-color:#BFE3CE;}
+
+  /* Privacy banner */
+  .privacy-banner{
+    display:flex; align-items:center; gap:1rem;
+    background:linear-gradient(120deg, #0E6B4E, #159A6E);
+    color:#EFFBF4;
+    border-radius:var(--radius);
+    padding:1rem 1.3rem;
+    margin-bottom:1.25rem;
+    box-shadow:var(--shadow-md);
+    flex-wrap:wrap;
+  }
+  .privacy-banner .shield{
+    flex-shrink:0;
+    width:2.4rem; height:2.4rem;
+    border-radius:10px;
+    background:rgba(255,255,255,0.15);
+    display:flex; align-items:center; justify-content:center;
+  }
+  .privacy-banner .text{flex:1; min-width:240px;}
+  .privacy-banner .text strong.title{display:block; font-size:0.95rem; margin-bottom:0.25rem;}
+  .privacy-banner .text span{font-size:0.82rem; color:#D6F3E5; line-height:1.55;}
+  .privacy-banner .badge{
+    flex-shrink:0;
+    background:rgba(255,255,255,0.16);
+    padding:0.4rem 0.85rem;
+    border-radius:999px;
+    font-size:0.75rem;
+    font-weight:600;
+    white-space:nowrap;
+  }
+
+  /* Stat cards */
+  .stat-grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));
+    gap:0.9rem;
+    margin-bottom:1.25rem;
+  }
+  .stat-tile{
+    border-radius:var(--radius);
+    padding:1.15rem 1.25rem;
+    color:#fff;
+    box-shadow:var(--shadow-md);
+    position:relative;
+    overflow:hidden;
+    min-height:104px;
+  }
+  .stat-tile::after{
+    content:"";
+    position:absolute; right:-20px; bottom:-20px;
+    width:90px; height:90px;
+    border-radius:50%;
+    background:rgba(255,255,255,0.08);
+  }
+  .stat-tile.t-files{background:linear-gradient(150deg, #16324F, #0A1A2C);}
+  .stat-tile.t-txn{background:linear-gradient(150deg, #1B8A63, #0E5A40);}
+  .stat-tile.t-debit{background:linear-gradient(150deg, #C0452E, #8A2E1C);}
+  .stat-tile.t-credit{background:linear-gradient(150deg, #7A5AC0, #4E3680);}
+  .stat-tile .stat-icon{opacity:0.9; margin-bottom:0.6rem;}
+  .stat-tile .stat-label{font-size:0.7rem; text-transform:uppercase; letter-spacing:0.06em; opacity:0.85; font-weight:600;}
+  .stat-tile .stat-value{font-family:'IBM Plex Mono',monospace; font-size:1.7rem; font-weight:600; margin-top:0.2rem;}
+  .stat-tile .stat-foot{font-size:0.7rem; opacity:0.6; margin-top:0.35rem;}
+
+  /* Bank badges */
+  .bank-badges{
+    display:flex; flex-wrap:wrap; gap:0.7rem;
+    margin-bottom:1.25rem;
+  }
+  .bank-badge{
+    display:flex; align-items:center; gap:0.6rem;
+    background:var(--paper);
+    border:1px solid var(--rule);
+    border-radius:10px;
+    padding:0.65rem 1rem;
+    font-size:0.85rem;
+    font-weight:600;
+    box-shadow:var(--shadow-sm);
+  }
+  .bank-badge .swatch-dot{width:0.6rem; height:0.6rem; border-radius:50%;}
+  .bank-badge .count{
+    background:#EEF1F4; color:var(--ink-soft);
+    font-family:'IBM Plex Mono',monospace;
+    font-size:0.72rem; font-weight:600;
+    padding:0.1rem 0.5rem; border-radius:999px;
+  }
+  .bank-badges-empty{
+    font-size:0.83rem; color:var(--ink-soft);
+    padding:0.85rem 1rem;
+    border:1px dashed var(--rule);
+    border-radius:10px;
+    margin-bottom:1.25rem;
+    background:var(--paper);
+  }
+
+  /* Toolbar */
+  .toolbar{
+    display:flex; align-items:center; gap:1.4rem; flex-wrap:wrap;
+    padding:0.75rem 1.1rem;
+    margin-bottom:1rem;
+  }
+  .tb-group{display:flex; align-items:center; gap:0.55rem;}
+  .tb-group-label{
+    font-size:0.65rem; text-transform:uppercase; letter-spacing:0.07em;
+    color:var(--ink-soft); font-weight:700; margin-right:0.15rem;
+  }
+  .tb-divider{width:1px; height:1.6rem; background:var(--rule);}
+
+  button.tb-btn{
+    font-size:0.83rem; font-weight:600;
+    padding:0.55rem 0.95rem;
+    border-radius:8px;
+    border:1px solid transparent;
+    cursor:pointer;
+    display:inline-flex; align-items:center; gap:0.45rem;
+    transition:transform 0.1s ease, box-shadow 0.1s ease, filter 0.1s ease;
+    white-space:nowrap;
+  }
+  button.tb-btn:hover:not(:disabled){transform:translateY(-1px); filter:brightness(1.05);}
+  button.tb-btn:disabled{opacity:0.5; cursor:not-allowed;}
+  .tb-btn.primary{background:linear-gradient(135deg, var(--navy), var(--navy-glow)); color:#fff; box-shadow:var(--shadow-sm);}
+  .tb-btn.danger{background:#FBEDEA; color:var(--debit);}
+  .tb-btn.danger:hover:not(:disabled){background:#F8DFDA;}
+  .tb-btn.ghost{background:#F1F3F5; color:var(--ink);}
+  .tb-btn.excel{background:linear-gradient(135deg, #1F7A5C, #154F3C); color:#fff; box-shadow:var(--shadow-sm);}
+  .tb-btn.csv{background:#EAF3FB; color:#1D5A8C;}
+  select.tb-select{
+    font:inherit; font-size:0.83rem; font-weight:500;
+    padding:0.55rem 0.7rem;
+    border:1.5px solid var(--rule); border-radius:8px;
+    background:var(--paper); color:var(--ink);
+  }
+  .tb-btn .spinner{
+    width:0.85rem; height:0.85rem; border-radius:50%;
+    border:2px solid rgba(255,255,255,0.4); border-top-color:#fff;
+    animation:spin 0.7s linear infinite; display:none;
+  }
+  .tb-btn.loading .spinner{display:inline-block;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+
+  input#fileInput{display:none;}
+  .pending-file{
+    display:none; align-items:center; gap:0.6rem;
+    padding:0.55rem 0.9rem; margin:-0.4rem 0 1rem;
+    background:#F2FAF6; border:1px solid #BFE3CE; border-radius:9px;
+    font-size:0.82rem; color:var(--ink);
+  }
+  .pending-file.show{display:flex;}
+  .pending-file button{
+    margin-left:auto; background:none; border:none; color:var(--ink-soft);
+    cursor:pointer; font-size:0.9rem; padding:0.1rem 0.4rem;
+  }
+
+  .status{
+    margin:0 0 1rem;
+    font-size:0.85rem;
+    padding:0.7rem 0.9rem;
+    border-radius:9px;
+    border-left:3px solid var(--rule);
+    display:none;
+    align-items:center;
+    gap:0.5rem;
+    animation:fadeIn 0.2s ease;
+  }
+  .status.ok{border-color:var(--credit); background:#F1F8F5; color:#155C43;}
+  .status.err{border-color:var(--debit); background:#FBF0EC; color:#8A331E;}
+  .status.info{border-color:#8B93A0; background:#F4F5F7; color:var(--ink-soft);}
+  @keyframes fadeIn{from{opacity:0; transform:translateY(-3px);} to{opacity:1; transform:none;}}
+
+  /* Search + filter */
+  .search-bar{
+    display:flex; align-items:center; gap:0.9rem; flex-wrap:wrap;
+    padding:0.7rem 1.1rem;
+    margin-bottom:0.9rem;
+  }
+  .search-input-wrap{
+    flex:1; min-width:220px;
+    display:flex; align-items:center; gap:0.5rem;
+    padding:0.5rem 0.8rem;
+    background:#F6F7F9; border:1px solid var(--rule); border-radius:8px;
+  }
+  .search-input-wrap svg{flex-shrink:0; opacity:0.5;}
+  .search-input-wrap input{
+    border:none; background:none; outline:none; font:inherit; font-size:0.85rem;
+    width:100%; color:var(--ink);
+  }
+  .filter-pills{display:flex; gap:0.5rem; flex-wrap:wrap;}
+  .filter-pill{
+    display:flex; align-items:center; gap:0.4rem;
+    padding:0.4rem 0.8rem;
+    border-radius:999px;
+    font-size:0.78rem; font-weight:600;
+    background:#EEF0F3; color:var(--ink-soft);
+    border:1.5px solid transparent;
+    cursor:pointer;
+    white-space:nowrap;
+  }
+  .filter-pill .fp-count{
+    background:rgba(255,255,255,0.6);
+    padding:0.05rem 0.4rem; border-radius:999px; font-family:'IBM Plex Mono',monospace;
+  }
+  .filter-pill.active{background:var(--navy); color:#fff;}
+  .filter-pill.active .fp-count{background:rgba(255,255,255,0.2);}
+  .filter-pill[data-f="debit"]:not(.active){color:var(--debit);}
+  .filter-pill[data-f="credit"]:not(.active){color:var(--credit);}
+  .filter-pill[data-f="incomplete"]:not(.active){color:#A65420;}
+
+  /* Table */
+  .table-card{padding:0; overflow:hidden;}
+  .table-wrap{overflow-x:auto; overflow-y:auto; max-height:60vh;}
+  table{border-collapse:collapse; width:100%; font-size:0.83rem; table-layout:fixed;}
+  thead th{
+    position:sticky; top:0;
+    background:linear-gradient(180deg, var(--navy-light), var(--navy));
+    color:#fff; font-weight:600; text-align:left;
+    padding:0.65rem 0.9rem 0.65rem 0.65rem;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    user-select:none;
+  }
+  thead th.num{text-align:right;}
+  tbody td{
+    padding:0.55rem 0.65rem;
+    border-bottom:1px solid var(--rule);
+    font-family:'IBM Plex Mono',monospace;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  tbody td.desc{font-family:'Inter',sans-serif; white-space:normal; word-break:break-word;}
+  tbody td.num{text-align:right;}
+  tbody tr{transition:background 0.1s ease;}
+  tbody tr:nth-child(even){background:#FAFAF8;}
+  tbody tr:hover{background:#EEF4FB;}
+  tbody tr.incomplete{background:var(--highlight) !important;}
+  td.debit-amt{color:var(--debit);}
+  td.credit-amt{color:var(--credit);}
+  td.crdr-DR{color:var(--debit); font-weight:600;}
+  td.crdr-CR{color:var(--credit); font-weight:600;}
+  .col-resizer{position:absolute; top:0; right:0; width:8px; height:100%; cursor:col-resize; z-index:3; touch-action:none;}
+  .col-resizer:hover, .col-resizer.active{background:rgba(255,255,255,0.35);}
+  th{position:relative;}
+
+  .empty-state{
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    padding:3.5rem 1.5rem;
+    color:var(--ink-soft);
+    text-align:center;
+  }
+  .empty-state svg{margin-bottom:1rem; opacity:0.7;}
+  .empty-state .es-title{font-size:1.05rem; font-weight:700; color:var(--ink); margin-bottom:0.3rem;}
+  .empty-state .es-sub{font-size:0.85rem;}
+
+  .legend{margin:0.7rem 1.1rem 0; font-size:0.78rem; color:var(--ink-soft); display:flex; align-items:center; gap:0.5rem;}
+  .legend .swatch{width:0.85rem; height:0.85rem; border-radius:3px; background:var(--highlight); border:1px solid #E2C878; display:inline-block;}
+
+  details.help-panel{
+    margin-top:1.5rem;
+    background:var(--paper);
+    border:1px solid var(--rule);
+    border-radius:var(--radius);
+    padding:1.1rem 1.3rem;
+    font-size:0.83rem;
+    color:var(--ink-soft);
+  }
+  details.help-panel summary{cursor:pointer; font-weight:700; color:var(--ink); font-size:0.9rem;}
+  details.help-panel ul{padding-left:1.2rem; margin:0.9rem 0 0;}
+  details.help-panel li{margin-bottom:0.5rem;}
+  details.help-panel .about-line{margin-top:1rem; padding-top:1rem; border-top:1px solid var(--rule);}
+
+  @media (max-width:880px){
+    .sidebar{display:none;}
+    .main{padding:1.25rem 1rem 3rem;}
+  }
+</style>
+</head>
+<body>
+
+<div class="app-shell">
+
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 10l9-6 9 6M5 10v9h14v-9M9 19v-6h6v6" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div>
+        <div class="brand-name">Bank Marco</div>
+        <div class="brand-sub">Statement Converter</div>
+      </div>
+    </div>
+    <ul class="nav">
+      <li><a href="#dashboard" class="active" data-section="dashboard">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="3" y="3" width="7" height="9" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="14" y="3" width="7" height="5" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="14" y="12" width="7" height="9" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="3" y="16" width="7" height="5" rx="1.5" stroke="currentColor" stroke-width="1.8"/></svg>
+        Dashboard
+      </a></li>
+      <li><a href="#importSection" data-section="import">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Import Files
+      </a></li>
+      <li><a href="#recordsSection" data-section="records">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4 6h16M4 12h16M4 18h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        Records
+      </a></li>
+      <li><a href="#exportSection" data-section="export">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Export
+      </a></li>
+      <li><a href="#helpSection" data-section="help">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/><path d="M9.5 9a2.5 2.5 0 015 .2c0 1.6-2.2 1.8-2.4 3.3M12 17h.01" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        Help / Formats
+      </a></li>
+    </ul>
+    <div class="nav-spacer"></div>
+    <div class="sidebar-foot">Runs 100% in your browser.<br>No files ever leave this device.</div>
+  </aside>
+
+  <main class="main">
+
+    <div class="topbar" id="dashboard">
+      <div>
+        <h1>Dashboard</h1>
+        <p>Import statements, review the combined ledger, and export a clean Bank Marco-format file.</p>
+      </div>
+      <div id="topStatusPill" class="pill neutral"><span class="pill-dot"></span> Idle</div>
+    </div>
+
+    <!-- Save location -->
+    <div class="card save-bar" id="settingsSection">
+      <div class="save-label">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="#5B6472" stroke-width="1.8"/></svg>
+        Save Location:
+      </div>
+      <div class="format-chip">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M20 6L9 17l-5-5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Excel &amp; CSV
+      </div>
+      <div class="save-path" id="savePathText">No folder chosen yet — exports will use your browser's normal download prompt.</div>
+      <button class="tb-btn primary" id="chooseFolderBtn">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="white" stroke-width="2"/></svg>
+        <span id="chooseFolderLabel">Choose Folder</span>
+      </button>
+      <div class="pill neutral" id="folderStatusPill"><span class="pill-dot"></span> Not set</div>
+    </div>
+
+    <!-- Privacy banner -->
+    <div class="privacy-banner">
+      <div class="shield">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6l7-3z" stroke="white" stroke-width="2" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="text">
+        <strong class="title">Your Data Stays on Your Computer — Always</strong>
+        <span><strong>100% local processing:</strong> every file is parsed entirely in this browser tab. Nothing is ever uploaded to a server or stored in the cloud — your statements stay private on your own device. When you export, you choose exactly where the file is saved.</span>
+      </div>
+      <div class="badge">Zero Data Upload</div>
+    </div>
+
+    <!-- Stat cards -->
+    <div class="stat-grid">
+      <div class="stat-tile t-files">
+        <div class="stat-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M7 3h7l5 5v13a1 1 0 01-1 1H7a1 1 0 01-1-1V4a1 1 0 011-1z" stroke="white" stroke-width="1.8" stroke-linejoin="round"/></svg></div>
+        <div class="stat-label">Files Imported</div>
+        <div class="stat-value" id="statFiles">0</div>
+        <div class="stat-foot">—</div>
+      </div>
+      <div class="stat-tile t-txn">
+        <div class="stat-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4 19V9m6 10V4m6 15v-7" stroke="white" stroke-width="2" stroke-linecap="round"/></svg></div>
+        <div class="stat-label">Total Transactions</div>
+        <div class="stat-value" id="statTxn">0</div>
+        <div class="stat-foot">—</div>
+      </div>
+      <div class="stat-tile t-debit">
+        <div class="stat-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 5v14m-6-6l6 6 6-6" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <div class="stat-label">Total Debit</div>
+        <div class="stat-value" id="statDebit">0.00</div>
+        <div class="stat-foot">—</div>
+      </div>
+      <div class="stat-tile t-credit">
+        <div class="stat-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 19V5m6 6l-6-6-6 6" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <div class="stat-label">Total Credit</div>
+        <div class="stat-value" id="statCredit">0.00</div>
+        <div class="stat-foot">—</div>
+      </div>
+    </div>
+
+    <!-- Bank badges -->
+    <div id="bankBadges"></div>
+
+    <!-- Import / toolbar -->
+    <div class="card toolbar" id="importSection">
+      <div class="tb-group">
+        <span class="tb-group-label">File</span>
+        <button class="tb-btn primary" id="importBtn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Import
+        </button>
+        <button class="tb-btn danger" id="clearBtn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4 7h16M9 7V5a1 1 0 011-1h4a1 1 0 011 1v2m2 0v12a2 2 0 01-2 2H8a2 2 0 01-2-2V7h12z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Clear All
+        </button>
+        <input type="file" id="fileInput" accept=".xls,.xlsx,.csv">
+      </div>
+      <div class="tb-divider"></div>
+      <div class="tb-group">
+        <span class="tb-group-label">Parse</span>
+        <select id="formatSelect" class="tb-select">
+          <option value="auto">Auto-detect</option>
+          <option value="icici_quick">ICICI — Quick Statement</option>
+          <option value="icici_saving">ICICI — Detailed Statement</option>
+          <option value="kotak">Kotak Mahindra</option>
+          <option value="canara">Canara Bank</option>
+          <option value="hdfc">HDFC Bank</option>
+          <option value="axis">Axis Bank</option>
+          <option value="pnb">PNB</option>
+          <option value="sbi">SBI (State Bank of India)</option>
+        </select>
+        <button class="tb-btn primary" id="convertBtn" disabled>
+          <span class="spinner"></span>
+          <span class="btn-label">Convert &amp; Add</span>
+        </button>
+      </div>
+      <div class="tb-divider" id="exportSection"></div>
+      <div class="tb-group">
+        <span class="tb-group-label">Export</span>
+        <button class="tb-btn excel" id="downloadXlsx">
+          <span class="spinner"></span>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span class="btn-label">Excel</span>
+        </button>
+        <button class="tb-btn csv" id="downloadCsv">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14" stroke="#1D5A8C" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          CSV
+        </button>
+      </div>
+    </div>
+
+    <div class="pending-file" id="pendingFile">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M7 3h7l5 5v13a1 1 0 01-1 1H7a1 1 0 01-1-1V4a1 1 0 011-1z" stroke="#1B2430" stroke-width="1.6"/></svg>
+      <span id="pendingFileName"></span>
+      <button id="pendingFileClear" title="Remove">✕</button>
+    </div>
+
+    <div id="status" class="status"></div>
+
+    <!-- Search + filters -->
+    <div class="card search-bar">
+      <div class="search-input-wrap">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="11" cy="11" r="7" stroke="#5B6472" stroke-width="2"/><path d="M21 21l-4.3-4.3" stroke="#5B6472" stroke-width="2" stroke-linecap="round"/></svg>
+        <input type="text" id="searchInput" placeholder="Search description or Chq / Ref No…">
+      </div>
+      <div class="filter-pills" id="filterPills">
+        <div class="filter-pill active" data-f="all">All <span class="fp-count" id="fpAll">0</span></div>
+        <div class="filter-pill" data-f="debit">Debit <span class="fp-count" id="fpDebit">0</span></div>
+        <div class="filter-pill" data-f="credit">Credit <span class="fp-count" id="fpCredit">0</span></div>
+        <div class="filter-pill" data-f="incomplete">Incomplete <span class="fp-count" id="fpIncomplete">0</span></div>
+      </div>
+    </div>
+
+    <!-- Records table -->
+    <div class="card table-card" id="recordsSection">
+      <div class="table-wrap" id="tableWrap">
+        <table id="resultsTable">
+          <colgroup>
+            <col style="width:4%"><col style="width:10%"><col style="width:10%"><col style="width:11%">
+            <col style="width:26%"><col style="width:9%"><col style="width:9%"><col style="width:11%">
+            <col style="width:5%"><col style="width:5%">
+          </colgroup>
+          <thead>
+            <tr>
+              <th>Sl. No.<span class="col-resizer"></span></th>
+              <th>Transaction Date<span class="col-resizer"></span></th>
+              <th>Value Date<span class="col-resizer"></span></th>
+              <th>Chq / Ref No.<span class="col-resizer"></span></th>
+              <th>Description<span class="col-resizer"></span></th>
+              <th class="num">Debit<span class="col-resizer"></span></th>
+              <th class="num">Credit<span class="col-resizer"></span></th>
+              <th class="num">Balance<span class="col-resizer"></span></th>
+              <th>Dr / Cr<span class="col-resizer"></span></th>
+              <th>Source</th>
+            </tr>
+          </thead>
+          <tbody id="resultsBody"></tbody>
+        </table>
+      </div>
+      <div class="empty-state" id="emptyState">
+        <svg width="52" height="52" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 7l3-3h5l2 2h8v11a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" fill="#F5C563"/></svg>
+        <div class="es-title">No statements imported yet</div>
+        <div class="es-sub">Click <strong>Import</strong> above, choose a file, then <strong>Convert &amp; Add</strong>.</div>
+      </div>
+      <div class="legend" id="tableLegend" style="display:none;">
+        <span class="swatch"></span> Row is missing a date or description even after the Chq/Ref No. fallback — worth checking manually.
+      </div>
+      <div style="height:0.9rem;"></div>
+    </div>
+
+    <details class="help-panel" id="helpSection">
+      <summary>Supported formats &amp; how this works</summary>
+      <ul>
+        <li><strong>ICICI — Quick Statement</strong>: the "OpTransactionHistoryUX3" export. One combined Amount column with a Cr/Dr sign column.</li>
+        <li><strong>ICICI — Detailed Statement</strong>: the "OpTransactionHistory" export. Header sits in column B; Withdrawal/Deposit already split; Value Date precedes Transaction Date.</li>
+        <li><strong>Kotak Mahindra</strong>: CSV with two "Dr / Cr" columns — only the first (next to Amount) is used.</li>
+        <li><strong>Canara Bank</strong>: CSV with no serial number column (generated here), a letterhead preamble, timestamped Txn Date and a "03 Aug 2026"-style Value Date.</li>
+        <li><strong>HDFC Bank</strong>: two-digit years, asterisk divider rows, and a trailing "Opening Balance" row that's correctly excluded.</li>
+        <li><strong>Axis Bank</strong>: only one date column (used for both Transaction and Value Date); stops at the "Charge breakup" section.</li>
+        <li><strong>PNB</strong>: only one date column; Balance carries a trailing "Cr."/"Dr." suffix that's stripped.</li>
+        <li><strong>SBI</strong>: only one date column; "Details" cells often contain embedded line breaks that get collapsed into one clean line; Ref No/Cheque No. is usually blank, so the LEFT(4)-of-Description fallback applies here too.</li>
+      </ul>
+      <div class="about-line">Every parser, and the Excel/CSV file generation, runs entirely in this browser tab — nothing is uploaded anywhere. The "Choose Folder" option (Chrome/Edge only) uses your browser's native File System Access permission so exports save straight into that folder without asking again, until you click "Change Folder" yourself.</div>
+    </details>
+
+  </main>
+</div>
+
+<script>
+function excelSerialToDate(n) {
+  const ms = Math.round(n) * 86400000;
+  return new Date(Date.UTC(1899, 11, 30) + ms);
+}
+function normalizeDateOnly(d) {
+  if (!d || isNaN(d.getTime())) return null;
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+}
+function isSaneStatementYear(d) {
+  if (!d) return false;
+  const y = d.getUTCFullYear();
+  return y >= 1990 && y <= 2100;
+}
+function parseDMY(v) {
+  if (v === null || v === undefined || v === '') return null;
+  if (v instanceof Date) return normalizeDateOnly(v);
+  if (typeof v === 'number') {
+    const d = normalizeDateOnly(excelSerialToDate(v));
+    return isSaneStatementYear(d) ? d : null;
+  }
+  const s = String(v).trim().split(' ')[0];
+  const parts = s.split('/');
+  if (parts.length !== 3) return null;
+  const d = parseInt(parts[0], 10), m = parseInt(parts[1], 10), y = parseInt(parts[2], 10);
+  if (!d || !m || !y) return null;
+  return new Date(Date.UTC(y, m - 1, d));
+}
+function parseDMYDash(v) {
+  if (v === null || v === undefined || v === '') return null;
+  if (v instanceof Date) return normalizeDateOnly(v);
+  if (typeof v === 'number') {
+    const d = normalizeDateOnly(excelSerialToDate(v));
+    return isSaneStatementYear(d) ? d : null;
+  }
+  const s = String(v).trim().split(' ')[0];
+  const parts = s.split('-');
+  if (parts.length !== 3) return null;
+  const d = parseInt(parts[0], 10), m = parseInt(parts[1], 10), y = parseInt(parts[2], 10);
+  if (!d || !m || !y) return null;
+  return new Date(Date.UTC(y, m - 1, d));
+}
+function parseDDMMYY2digit(v) {
+  if (v === null || v === undefined || v === '') return null;
+  if (v instanceof Date) return normalizeDateOnly(v);
+  if (typeof v === 'number') {
+    const d = normalizeDateOnly(excelSerialToDate(v));
+    return isSaneStatementYear(d) ? d : null;
+  }
+  const s = String(v).trim();
+  const parts = s.split('/');
+  if (parts.length !== 3) return null;
+  let d = parseInt(parts[0], 10), m = parseInt(parts[1], 10), y = parseInt(parts[2], 10);
+  if (!d || !m || y === undefined || isNaN(y)) return null;
+  if (y < 100) y += 2000;
+  return new Date(Date.UTC(y, m - 1, d));
+}
+const MONTHS = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+function parseMonName(v) {
+  if (v === null || v === undefined || v === '') return null;
+  if (v instanceof Date) return normalizeDateOnly(v);
+  if (typeof v === 'number') {
+    const d = normalizeDateOnly(excelSerialToDate(v));
+    return isSaneStatementYear(d) ? d : null;
+  }
+  const s = String(v).trim();
+  const parts = s.split(' ').filter(Boolean);
+  if (parts.length !== 3) return null;
+  const d = parseInt(parts[0], 10);
+  const mi = MONTHS.indexOf(parts[1].slice(0, 3).toLowerCase());
+  const y = parseInt(parts[2], 10);
+  if (!d || mi === -1 || !y) return null;
+  return new Date(Date.UTC(y, mi, d));
+}
+function cleanNumber(v) {
+  if (v === null || v === undefined) return 0;
+  if (typeof v === 'number') return v;
+  let s = String(v).replace(/,/g, '').replace(/"/g, '').trim();
+  if (s === '' || s === '-' || s === '.') return 0;
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+function cleanBalance(v) {
+  if (typeof v === 'number') return v;
+  let s = String(v ?? '').trim();
+  s = s.replace(/\s*(Cr\.?|Dr\.?|CR\.?|DR\.?)\s*$/i, '');
+  return cleanNumber(s);
+}
+function isPureNumber(v) {
+  if (v === null || v === undefined || v === '') return false;
+  if (typeof v === 'number') return !isNaN(v);
+  return /^-?\d+(\.\d+)?$/.test(String(v).trim());
+}
+function fmtDate(d) {
+  if (!d) return '';
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const yyyy = d.getUTCFullYear();
+  return `${dd}/${mm}/${yyyy}`;
+}
+function findHeaderRow(grid, mustContain, maxScan) {
+  maxScan = maxScan || 60;
+  for (let r = 0; r < Math.min(grid.length, maxScan); r++) {
+    const rowVals = (grid[r] || []).map(v => String(v == null ? '' : v).trim());
+    if (mustContain.every(needle => rowVals.includes(needle))) return r;
+  }
+  return -1;
+}
+function colMapByHeader(grid, headerRow) {
+  const map = {};
+  (grid[headerRow] || []).forEach((h, i) => {
+    const key = String(h == null ? '' : h).trim();
+    if (key && !(key in map)) map[key] = i;
+  });
+  return map;
+}
+
+function parseICICIQuick(grid) {
+  const hr = findHeaderRow(grid, ['No.', 'Description']);
+  if (hr === -1) return null;
+  const c = colMapByHeader(grid, hr);
+  const need = ['No.', 'Txn Posted Date', 'Value Date', 'ChequeNo.', 'Description', 'Cr/Dr', 'Transaction Amount(INR)', 'Available Balance(INR)'];
+  for (const k of need) if (!(k in c)) return null;
+  const out = [];
+  let sl = 1;
+  for (let r = hr + 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    if (!isPureNumber(row[c['No.']])) continue;
+    const txnDate = parseDMY(row[c['Txn Posted Date']]);
+    const valDate = parseDMY(row[c['Value Date']]);
+    let chq = String(row[c['ChequeNo.']] ?? '').trim();
+    if (chq === '-') chq = '';
+    const desc = String(row[c['Description']] ?? '').trim();
+    const crdr = String(row[c['Cr/Dr']] ?? '').trim().toUpperCase();
+    const amt = cleanNumber(row[c['Transaction Amount(INR)']]);
+    const bal = cleanNumber(row[c['Available Balance(INR)']]);
+    out.push({ sl: sl++, txnDate, valDate, chq, desc,
+      debit: crdr === 'DR' ? amt : 0, credit: crdr === 'CR' ? amt : 0, bal, crdr });
+  }
+  return out;
+}
+
+function parseICICISaving(grid) {
+  const hr = findHeaderRow(grid, ['S No.', 'Transaction Remarks']);
+  if (hr === -1) return null;
+  const c = colMapByHeader(grid, hr);
+  const need = ['S No.', 'Value Date', 'Transaction Date', 'Cheque Number', 'Transaction Remarks', 'Withdrawal Amount(INR)', 'Deposit Amount(INR)', 'Balance(INR)'];
+  for (const k of need) if (!(k in c)) return null;
+  const out = [];
+  let sl = 1;
+  for (let r = hr + 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    if (!isPureNumber(row[c['S No.']])) continue;
+    const txnDate = parseDMY(row[c['Transaction Date']]);
+    const valDate = parseDMY(row[c['Value Date']]);
+    let chq = String(row[c['Cheque Number']] ?? '').trim();
+    if (chq === '-') chq = '';
+    const desc = String(row[c['Transaction Remarks']] ?? '').trim();
+    const withdrawal = cleanNumber(row[c['Withdrawal Amount(INR)']]);
+    const deposit = cleanNumber(row[c['Deposit Amount(INR)']]);
+    const bal = cleanNumber(row[c['Balance(INR)']]);
+    const crdr = withdrawal > 0 ? 'DR' : (deposit > 0 ? 'CR' : '');
+    out.push({ sl: sl++, txnDate, valDate, chq, desc, debit: withdrawal, credit: deposit, bal, crdr });
+  }
+  return out;
+}
+
+function parseKotak(grid) {
+  let hr = -1;
+  for (let r = 0; r < Math.min(grid.length, 60); r++) {
+    if (String((grid[r] || [])[0] ?? '').trim() === 'Sl. No.') { hr = r; break; }
+  }
+  if (hr === -1) return null;
+  const headers = grid[hr].map(h => String(h ?? '').trim());
+  const norm = headers.map(h => h.replace(/\s+/g, ''));
+  const colSl = norm.indexOf('Sl.No.');
+  const colTxnDate = norm.indexOf('TransactionDate');
+  const colValDate = norm.indexOf('ValueDate');
+  const colDesc = norm.indexOf('Description');
+  const colChq = norm.findIndex(n => n.includes('Chq') || n.includes('Ref'));
+  const colBal = norm.indexOf('Balance');
+  const colCrDr = norm.indexOf('Dr/Cr');
+  const colAmt = norm.indexOf('Amount');      // older Kotak export: combined Amount + sign
+  const colDebit = norm.indexOf('Debit');     // newer Kotak export: split Debit/Credit
+  const colCredit = norm.indexOf('Credit');
+
+  const hasCombinedAmount = colAmt !== -1;
+  const hasSplitDebitCredit = colDebit !== -1 && colCredit !== -1;
+  if (colSl === -1 || colDesc === -1 || colBal === -1 || (!hasCombinedAmount && !hasSplitDebitCredit)) return null;
+
+  const out = [];
+  let sl = 1;
+  for (let r = hr + 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    if (!isPureNumber(row[colSl])) continue; // skips the "Closing balance" footer row
+    const txnDate = parseDMY(row[colTxnDate]);
+    const valDate = parseDMY(row[colValDate]);
+    let chq = String(row[colChq] ?? '').trim();
+    if (chq === '-') chq = '';
+    const desc = String(row[colDesc] ?? '').trim();
+    const bal = cleanNumber(row[colBal]);
+
+    let debit, credit, crdr;
+    if (hasCombinedAmount) {
+      // Older layout: the Dr/Cr column right next to Amount IS the transaction's sign.
+      crdr = String(row[colCrDr] ?? '').trim().toUpperCase();
+      const amt = cleanNumber(row[colAmt]);
+      debit = crdr === 'DR' ? amt : 0;
+      credit = crdr === 'CR' ? amt : 0;
+    } else {
+      // Newer layout: Debit/Credit are already split. The one Dr/Cr column
+      // here sits right after Balance and reflects the BALANCE's sign
+      // (almost always "CR" for a healthy account) - not the individual
+      // transaction's direction. Always derive Dr/Cr from the amounts instead.
+      debit = cleanNumber(row[colDebit]);
+      credit = cleanNumber(row[colCredit]);
+      crdr = debit > 0 ? 'DR' : (credit > 0 ? 'CR' : '');
+    }
+    out.push({ sl: sl++, txnDate, valDate, chq, desc, debit, credit, bal, crdr });
+  }
+  return out;
+}
+
+function parseCanara(grid) {
+  const hr = findHeaderRow(grid, ['Txn Date', 'Description']);
+  if (hr === -1) return null;
+  const c = colMapByHeader(grid, hr);
+  const need = ['Txn Date', 'Value Date', 'Description', 'Debit', 'Credit', 'Balance'];
+  for (const k of need) if (!(k in c)) return null;
+  const out = [];
+  let sl = 1;
+  for (let r = hr + 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    const txnText = row[c['Txn Date']];
+    if (txnText === undefined || txnText === null || String(txnText).trim() === '') continue;
+    const txnDate = parseDMYDash(txnText);
+    if (!txnDate) continue;
+    const valDate = parseMonName(row[c['Value Date']]);
+    let chq = 'Cheque No.' in c ? String(row[c['Cheque No.']] ?? '').trim() : '';
+    if (chq === '-') chq = '';
+    const desc = String(row[c['Description']] ?? '').trim();
+    const debit = cleanNumber(row[c['Debit']]);
+    const credit = cleanNumber(row[c['Credit']]);
+    const bal = cleanNumber(row[c['Balance']]);
+    const crdr = debit > 0 ? 'DR' : (credit > 0 ? 'CR' : '');
+    out.push({ sl: sl++, txnDate, valDate, chq, desc, debit, credit, bal, crdr });
+  }
+  return out;
+}
+
+function isAsteriskRow(row) {
+  let sawAny = false;
+  for (const v of row) {
+    const s = String(v ?? '').trim();
+    if (s) { sawAny = true; if (!/^\*+$/.test(s)) return false; }
+  }
+  return sawAny;
+}
+function parseHDFC(grid) {
+  const hr = findHeaderRow(grid, ['Narration']);
+  if (hr === -1) return null;
+  const hasWithdrawal = (grid[hr] || []).some(v => String(v ?? '').includes('Withdrawal'));
+  if (!hasWithdrawal) return null;
+  const headers = grid[hr].map(h => String(h ?? '').trim());
+  const c = {};
+  headers.forEach((h, i) => { if (h) c[h] = i; });
+  const dateCol = c['Date'];
+  const narrCol = c['Narration'];
+  const chqCol = c['Chq./Ref.No.'];
+  const valCol = c['Value Dt'] !== undefined ? c['Value Dt'] : c['Value Dt.'];
+  const wdCol = c['Withdrawal Amt.'];
+  const depCol = c['Deposit Amt.'];
+  const balCol = c['Closing Balance'];
+  if ([dateCol, narrCol, wdCol, depCol, balCol].some(i => i === undefined)) return null;
+  const out = [];
+  let sl = 1;
+  for (let r = hr + 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    const dateVal = row[dateCol];
+    if (dateVal === undefined || dateVal === null || String(dateVal).trim() === '') continue;
+    if (isAsteriskRow(row)) continue;
+    const txnDate = parseDDMMYY2digit(dateVal);
+    if (!txnDate) continue;
+    const valDate = parseDDMMYY2digit(row[valCol]);
+    let chq = chqCol !== undefined ? String(row[chqCol] ?? '').trim() : '';
+    if (chq === '-') chq = '';
+    const desc = String(row[narrCol] ?? '').trim();
+    const withdrawal = cleanNumber(row[wdCol]);
+    const deposit = cleanNumber(row[depCol]);
+    const bal = cleanNumber(row[balCol]);
+    const crdr = withdrawal > 0 ? 'DR' : (deposit > 0 ? 'CR' : '');
+    out.push({ sl: sl++, txnDate, valDate, chq, desc, debit: withdrawal, credit: deposit, bal, crdr });
+  }
+  return out;
+}
+
+function parseAxis(grid) {
+  let hr = -1;
+  for (let r = 0; r < Math.min(grid.length, 60); r++) {
+    const trimmed = (grid[r] || []).map(v => String(v ?? '').trim());
+    if (trimmed.includes('SRL NO') && trimmed.includes('PARTICULARS')) { hr = r; break; }
+  }
+  if (hr === -1) return null;
+  const headers = grid[hr].map(h => String(h ?? '').trim());
+  const c = {};
+  headers.forEach((h, i) => { if (h) c[h] = i; });
+  const need = ['SRL NO', 'Tran Date', 'PARTICULARS', 'DR', 'CR', 'BAL'];
+  for (const k of need) if (!(k in c)) return null;
+  const out = [];
+  let sl = 1;
+  for (let r = hr + 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    const srlText = String(row[c['SRL NO']] ?? '').trim();
+    if (!isPureNumber(srlText)) break;
+    const txnDate = parseDMYDash(row[c['Tran Date']]);
+    let chq = 'CHQNO' in c ? String(row[c['CHQNO']] ?? '').trim() : '';
+    if (chq === '-') chq = '';
+    const desc = String(row[c['PARTICULARS']] ?? '').trim();
+    const debit = cleanNumber(row[c['DR']]);
+    const credit = cleanNumber(row[c['CR']]);
+    const bal = cleanNumber(row[c['BAL']]);
+    const crdr = debit > 0 ? 'DR' : (credit > 0 ? 'CR' : '');
+    out.push({ sl: sl++, txnDate, valDate: txnDate, chq, desc, debit, credit, bal, crdr });
+  }
+  return out;
+}
+
+function parsePNB(grid) {
+  const hr = findHeaderRow(grid, ['Txn No.', 'Description']);
+  if (hr === -1) return null;
+  const c = colMapByHeader(grid, hr);
+  const need = ['Txn No.', 'Txn Date', 'Description', 'Dr Amount', 'Cr Amount', 'Balance'];
+  for (const k of need) if (!(k in c)) return null;
+  const out = [];
+  let sl = 1;
+  for (let r = hr + 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    const txnNoText = String(row[c['Txn No.']] ?? '').trim();
+    if (!txnNoText) break;
+    const txnDate = parseDMY(row[c['Txn Date']]);
+    if (!txnDate) continue;
+    let chq = 'Cheque No.' in c ? String(row[c['Cheque No.']] ?? '').trim() : '';
+    if (chq === '-') chq = '';
+    const desc = String(row[c['Description']] ?? '').trim();
+    const debit = cleanNumber(row[c['Dr Amount']]);
+    const credit = cleanNumber(row[c['Cr Amount']]);
+    const bal = cleanBalance(row[c['Balance']]);
+    const crdr = debit > 0 ? 'DR' : (credit > 0 ? 'CR' : '');
+    out.push({ sl: sl++, txnDate, valDate: txnDate, chq, desc, debit, credit, bal, crdr });
+  }
+  return out;
+}
+
+// SBI (State Bank of India): Date, Details, Ref No/Cheque No, Debit,
+// Credit, Balance. No serial column (generated here); only ONE date
+// column (used for both Transaction and Value Date); "Details" cells
+// routinely contain embedded line breaks from Excel's cell-wrap, which
+// are collapsed into a single clean line; "Ref No/Cheque No" is usually
+// blank, left as-is here since fillChqFromDescription() applies the same
+// LEFT(4) fallback used for every other bank. A letterhead/account-summary
+// preamble precedes the header, and a "Statement Summary" section follows
+// the transaction list - both are skipped by stopping at the first row
+// whose Date cell doesn't parse as a genuine date.
+function parseSBI(grid) {
+  const hr = findHeaderRow(grid, ['Date', 'Details']);
+  if (hr === -1) return null;
+  const c = colMapByHeader(grid, hr);
+  const need = ['Date', 'Details', 'Debit', 'Credit'];
+  for (const k of need) if (!(k in c)) return null;
+  const out = [];
+  let sl = 1;
+  for (let r = hr + 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    const txnDate = parseDMY(row[c['Date']]);
+    if (!txnDate) break; // hit the blank row / "Statement Summary" section - stop
+    let chq = 'Ref No/Cheque No' in c ? String(row[c['Ref No/Cheque No']] ?? '').trim() : '';
+    if (chq === '-') chq = '';
+    const desc = cleanMultilineText(row[c['Details']]);
+    const debit = cleanNumber(row[c['Debit']]);
+    const credit = cleanNumber(row[c['Credit']]);
+    const bal = 'Balance' in c ? cleanNumber(row[c['Balance']]) : 0;
+    const crdr = debit > 0 ? 'DR' : (credit > 0 ? 'CR' : '');
+    out.push({ sl: sl++, txnDate, valDate: txnDate, chq, desc, debit, credit, bal, crdr });
+  }
+  return out;
+}
+
+// Collapses embedded line breaks / tabs / repeated whitespace from a
+// wrapped Excel cell (SBI's "Details" column) into one clean line.
+function cleanMultilineText(v) {
+  return String(v ?? '').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// When a bank doesn't give a real cheque/reference number, the Description
+// usually starts with the transaction mode instead (e.g. "NEFT/ICIN209505...",
+// "IMPS/...", "RTGS/...", "UPI/..."). Rather than leaving Chq / Ref No.
+// blank, fill it with the first 4 characters of the Description so every
+// row has *something* there.
+function fillChqFromDescription(rows) {
+  rows.forEach(row => {
+    if (!row.chq) {
+      const left4 = (row.desc || '').trim().slice(0, 4);
+      if (left4) row.chq = left4;
+    }
+  });
+  return rows;
+}
+
+const PARSERS = [
+  { id: 'icici_quick', label: 'ICICI — Quick Statement', fn: parseICICIQuick },
+  { id: 'icici_saving', label: 'ICICI — Detailed Statement (Saving)', fn: parseICICISaving },
+  { id: 'kotak', label: 'Kotak Mahindra', fn: parseKotak },
+  { id: 'canara', label: 'Canara Bank', fn: parseCanara },
+  { id: 'hdfc', label: 'HDFC Bank', fn: parseHDFC },
+  { id: 'axis', label: 'Axis Bank', fn: parseAxis },
+  { id: 'pnb', label: 'PNB (Punjab National Bank)', fn: parsePNB },
+  { id: 'sbi', label: 'SBI (State Bank of India)', fn: parseSBI },
+];
+
+
+// ============================================================
+// Sidebar nav - smooth scroll + active state (single-page dashboard,
+// sections below are all on this one page)
+// ============================================================
+document.querySelectorAll('.nav a').forEach(link => {
+  link.addEventListener('click', e => {
+    e.preventDefault();
+    document.querySelectorAll('.nav a').forEach(a => a.classList.remove('active'));
+    link.classList.add('active');
+    const target = document.querySelector(link.getAttribute('href'));
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+
+// ============================================================
+// Element refs
+// ============================================================
+const fileInput = document.getElementById('fileInput');
+const importBtn = document.getElementById('importBtn');
+const clearBtn = document.getElementById('clearBtn');
+const pendingFile = document.getElementById('pendingFile');
+const pendingFileName = document.getElementById('pendingFileName');
+const pendingFileClear = document.getElementById('pendingFileClear');
+const formatSelect = document.getElementById('formatSelect');
+const convertBtn = document.getElementById('convertBtn');
+const statusEl = document.getElementById('status');
+const topStatusPill = document.getElementById('topStatusPill');
+
+const searchInput = document.getElementById('searchInput');
+const filterPills = document.getElementById('filterPills');
+
+const resultsBody = document.getElementById('resultsBody');
+const tableWrap = document.getElementById('tableWrap');
+const emptyState = document.getElementById('emptyState');
+const tableLegend = document.getElementById('tableLegend');
+
+const statFiles = document.getElementById('statFiles');
+const statTxn = document.getElementById('statTxn');
+const statDebit = document.getElementById('statDebit');
+const statCredit = document.getElementById('statCredit');
+const bankBadgesEl = document.getElementById('bankBadges');
+
+const chooseFolderBtn = document.getElementById('chooseFolderBtn');
+const chooseFolderLabel = document.getElementById('chooseFolderLabel');
+const savePathText = document.getElementById('savePathText');
+const folderStatusPill = document.getElementById('folderStatusPill');
+
+const downloadXlsxBtn = document.getElementById('downloadXlsx');
+const downloadCsvBtn = document.getElementById('downloadCsv');
+
+// ============================================================
+// State
+// ============================================================
+let currentFile = null;
+let allRecords = [];      // accumulated across every successful Convert & Add
+let currentFilter = 'all';
+let saveDirHandle = null; // File System Access API directory handle, once chosen
+
+const BANK_COLORS = {
+  'icici_quick': '#1F7A5C', 'icici_saving': '#2E6FE0', 'kotak': '#C0452E',
+  'canara': '#6B4FA0', 'hdfc': '#B8860B', 'axis': '#1595A8', 'pnb': '#A6395A',
+  'sbi': '#2E7D32',
 };
 
 function setStatus(msg, kind) {
