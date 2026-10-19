@@ -427,6 +427,63 @@
   details.help-panel li{margin-bottom:0.5rem;}
   details.help-panel .about-line{margin-top:1rem; padding-top:1rem; border-top:1px solid var(--rule);}
 
+  /* ---------------- Password modal ---------------- */
+  .modal-overlay{
+    display:none;
+    position:fixed; inset:0;
+    background:rgba(15,30,51,0.55);
+    backdrop-filter:blur(2px);
+    z-index:50;
+    align-items:center;
+    justify-content:center;
+    padding:1rem;
+  }
+  .modal-overlay.show{display:flex;}
+  .modal-card{
+    background:var(--paper);
+    border-radius:var(--radius);
+    box-shadow:var(--shadow-md);
+    padding:1.5rem;
+    width:100%;
+    max-width:380px;
+    animation:fadeIn 0.18s ease;
+  }
+  .modal-card h3{
+    font-family:'Source Serif 4',serif;
+    font-size:1.05rem;
+    margin:0 0 0.4rem;
+  }
+  .modal-card p{
+    margin:0 0 1rem;
+    font-size:0.85rem;
+    color:var(--ink-soft);
+  }
+  .modal-card input[type=password]{
+    width:100%;
+    font:inherit;
+    font-size:0.95rem;
+    padding:0.6rem 0.75rem;
+    border:1.5px solid var(--rule);
+    border-radius:8px;
+    margin-bottom:0.6rem;
+  }
+  .modal-card input[type=password]:focus{
+    outline:none;
+    border-color:var(--focus);
+    box-shadow:0 0 0 3px rgba(46,111,224,0.18);
+  }
+  .pw-note{
+    font-size:0.76rem !important;
+    color:var(--debit) !important;
+    min-height:1.1em;
+    margin-bottom:0.8rem !important;
+  }
+  .modal-actions{
+    display:flex;
+    justify-content:flex-end;
+    gap:0.6rem;
+  }
+
   @media (max-width:880px){
     .sidebar{display:none;}
     .main{padding:1.25rem 1rem 3rem;}
@@ -669,80 +726,102 @@
   </main>
 </div>
 
+<div class="modal-overlay" id="pwOverlay">
+  <div class="modal-card">
+    <h3 id="pwTitle">This file is password protected</h3>
+    <p id="pwMessage">Enter the password to unlock it.</p>
+    <input type="password" id="pwInput" autocomplete="off">
+    <p class="pw-note" id="pwNote"></p>
+    <div class="modal-actions">
+      <button class="secondary" id="pwCancel" type="button">Cancel</button>
+      <button id="pwUnlock" type="button">Unlock</button>
+    </div>
+  </div>
+</div>
+
 <script>
+let DATE_EPOCH_SHIFT = 0;       // 1462 for workbooks that use the 1904 date system
+const DATE_FAILS = [];          // raw values that could not be read as a date (shown to the user)
+function noteDateFail(v) {
+  const t = String(v).trim();
+  if (t && DATE_FAILS.length < 5 && !DATE_FAILS.includes(t)) DATE_FAILS.push(t);
+}
 function excelSerialToDate(n) {
-  const ms = Math.round(n) * 86400000;
+  const ms = (Math.floor(n) + DATE_EPOCH_SHIFT) * 86400000;   // floor: a time-of-day fraction must never push the date to the next day
   return new Date(Date.UTC(1899, 11, 30) + ms);
 }
 function normalizeDateOnly(d) {
   if (!d || isNaN(d.getTime())) return null;
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  // A JS Date made by a library is in LOCAL time; read it with local getters so IST never shifts the day.
+  return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
 }
 function isSaneStatementYear(d) {
   if (!d) return false;
   const y = d.getUTCFullYear();
   return y >= 1990 && y <= 2100;
 }
-function parseDMY(v) {
-  if (v === null || v === undefined || v === '') return null;
-  if (v instanceof Date) return normalizeDateOnly(v);
-  if (typeof v === 'number') {
-    const d = normalizeDateOnly(excelSerialToDate(v));
-    return isSaneStatementYear(d) ? d : null;
-  }
-  const s = String(v).trim().split(' ')[0];
-  const parts = s.split('/');
-  if (parts.length !== 3) return null;
-  const d = parseInt(parts[0], 10), m = parseInt(parts[1], 10), y = parseInt(parts[2], 10);
-  if (!d || !m || !y) return null;
-  return new Date(Date.UTC(y, m - 1, d));
-}
-function parseDMYDash(v) {
-  if (v === null || v === undefined || v === '') return null;
-  if (v instanceof Date) return normalizeDateOnly(v);
-  if (typeof v === 'number') {
-    const d = normalizeDateOnly(excelSerialToDate(v));
-    return isSaneStatementYear(d) ? d : null;
-  }
-  const s = String(v).trim().split(' ')[0];
-  const parts = s.split('-');
-  if (parts.length !== 3) return null;
-  const d = parseInt(parts[0], 10), m = parseInt(parts[1], 10), y = parseInt(parts[2], 10);
-  if (!d || !m || !y) return null;
-  return new Date(Date.UTC(y, m - 1, d));
-}
-function parseDDMMYY2digit(v) {
-  if (v === null || v === undefined || v === '') return null;
-  if (v instanceof Date) return normalizeDateOnly(v);
-  if (typeof v === 'number') {
-    const d = normalizeDateOnly(excelSerialToDate(v));
-    return isSaneStatementYear(d) ? d : null;
-  }
-  const s = String(v).trim();
-  const parts = s.split('/');
-  if (parts.length !== 3) return null;
-  let d = parseInt(parts[0], 10), m = parseInt(parts[1], 10), y = parseInt(parts[2], 10);
-  if (!d || !m || y === undefined || isNaN(y)) return null;
+function mkDate(y, m, d) {
   if (y < 100) y += 2000;
-  return new Date(Date.UTC(y, m - 1, d));
+  if (y < 1990 || y > 2100 || m < 1 || m > 12 || d < 1 || d > 31) return null;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCDate() === d ? dt : null;      // rejects 31/02 etc.
 }
 const MONTHS = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
-function parseMonName(v) {
-  if (v === null || v === undefined || v === '') return null;
-  if (v instanceof Date) return normalizeDateOnly(v);
+// ONE reader for every way a bank/Excel can hand us a date: real Date, Excel serial
+// (number OR text), dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy, yyyy-mm-dd, yyyymmdd, 15-Aug-2026,
+// "15 Aug 2026", Aug 15 2026, 2-digit years, any trailing time / AM / PM, ISO "T" time.
+function parseAnyDate(v) {
+  if (v === null || v === undefined) return null;
+  if (v instanceof Date) { const d = normalizeDateOnly(v); return isSaneStatementYear(d) ? d : null; }
   if (typeof v === 'number') {
-    const d = normalizeDateOnly(excelSerialToDate(v));
+    if (!isFinite(v) || v < 1) return null;
+    const d = normalizeDateOnly2(excelSerialToDate(v));
     return isSaneStatementYear(d) ? d : null;
   }
-  const s = String(v).trim();
-  const parts = s.split(' ').filter(Boolean);
-  if (parts.length !== 3) return null;
-  const d = parseInt(parts[0], 10);
-  const mi = MONTHS.indexOf(parts[1].slice(0, 3).toLowerCase());
-  const y = parseInt(parts[2], 10);
-  if (!d || mi === -1 || !y) return null;
-  return new Date(Date.UTC(y, mi, d));
+  let t = String(v).replace(/[ ​﻿]/g, ' ').replace(/^'+/, '').trim();
+  if (!t) return null;
+  if (/^#+$/.test(t)) { noteDateFail(t); return null; }
+  if (/^\d+(\.\d+)?$/.test(t)) {                        // number stored as text
+    if (/^\d{8}$/.test(t)) {                            // yyyymmdd
+      const d8 = mkDate(+t.slice(0, 4), +t.slice(4, 6), +t.slice(6, 8));
+      if (d8) return d8;
+    }
+    const d = normalizeDateOnly2(excelSerialToDate(parseFloat(t)));
+    if (isSaneStatementYear(d)) return d;
+    noteDateFail(t); return null;
+  }
+  t = t.replace(/(\d)T(\d)/i, '$1 $2');                 // ISO date-time
+  const toks = t.replace(/[\/\-.,]/g, ' ').split(/\s+/).filter(Boolean);
+  const dt = [];
+  for (const tok of toks) {
+    if (tok.includes(':') || /^(am|pm)$/i.test(tok) || dt.length >= 3) break;
+    if (/^\d+$/.test(tok)) dt.push({ n: +tok, len: tok.length });
+    else if (/^[A-Za-z]{3,}$/.test(tok) && MONTHS.includes(tok.slice(0, 3).toLowerCase()))
+      dt.push({ m: MONTHS.indexOf(tok.slice(0, 3).toLowerCase()) + 1 });
+    else break;
+  }
+  let r = null;
+  if (dt.length === 3) {
+    const [a, b, c] = dt;
+    if (a.n !== undefined && b.n !== undefined && c.n !== undefined) {
+      r = a.len === 4 ? mkDate(a.n, b.n, c.n) : mkDate(c.n, b.n, a.n);      // yyyy-mm-dd, else dd-mm-yyyy
+    } else if (a.n !== undefined && b.m && c.n !== undefined) {
+      r = a.len === 4 ? mkDate(a.n, b.m, c.n) : mkDate(c.n, b.m, a.n);      // 15 Aug 2026 / 2026 Aug 15
+    } else if (a.m && b.n !== undefined && c.n !== undefined) {
+      r = mkDate(c.n, a.m, b.n);                                              // Aug 15 2026
+    }
+  }
+  if (!r) noteDateFail(v);
+  return r;
 }
+function normalizeDateOnly2(d) {                        // for dates already built in UTC
+  if (!d || isNaN(d.getTime())) return null;
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+}
+function parseDMY(v) { return v === '' ? null : parseAnyDate(v); }
+function parseDMYDash(v) { return v === '' ? null : parseAnyDate(v); }
+function parseDDMMYY2digit(v) { return v === '' ? null : parseAnyDate(v); }
+function parseMonName(v) { return v === '' ? null : parseAnyDate(v); }
 function cleanNumber(v) {
   if (v === null || v === undefined) return 0;
   if (typeof v === 'number') return v;
@@ -845,8 +924,11 @@ function parseKotak(grid) {
   const headers = grid[hr].map(h => String(h ?? '').trim());
   const norm = headers.map(h => h.replace(/\s+/g, ''));
   const colSl = norm.indexOf('Sl.No.');
-  const colTxnDate = norm.indexOf('TransactionDate');
-  const colValDate = norm.indexOf('ValueDate');
+  const findCol = (...names) => norm.findIndex(n => names.some(x => n.toLowerCase() === x));
+  let colTxnDate = findCol('transactiondate', 'txndate', 'transdate', 'date');
+  if (colTxnDate === -1) colTxnDate = norm.findIndex(n => /trans|txn/i.test(n) && /date/i.test(n));
+  let colValDate = findCol('valuedate', 'valdate');
+  if (colValDate === -1) colValDate = norm.findIndex(n => /value/i.test(n) && /date/i.test(n));
   const colDesc = norm.indexOf('Description');
   const colChq = norm.findIndex(n => n.includes('Chq') || n.includes('Ref'));
   const colBal = norm.indexOf('Balance');
@@ -864,8 +946,19 @@ function parseKotak(grid) {
   for (let r = hr + 1; r < grid.length; r++) {
     const row = grid[r] || [];
     if (!isPureNumber(row[colSl])) continue; // skips the "Closing balance" footer row
-    const txnDate = parseDMY(row[colTxnDate]);
-    const valDate = parseDMY(row[colValDate]);
+    let txnDate = colTxnDate >= 0 ? parseDMY(row[colTxnDate]) : null;
+    let valDate = colValDate >= 0 ? parseDMY(row[colValDate]) : null;
+    if (!txnDate || !valDate) {
+      // Safety net: look at every cell left of Description for a readable date
+      const found = [];
+      for (let j = 0; j < colDesc; j++) {
+        if (j === colSl) continue;
+        const dj = parseAnyDate(row[j]);
+        if (dj) found.push(dj);
+      }
+      if (!txnDate) txnDate = found[0] || valDate || null;
+      if (!valDate) valDate = found[1] || found[0] || txnDate || null;
+    }
     let chq = String(row[colChq] ?? '').trim();
     if (chq === '-') chq = '';
     const desc = String(row[colDesc] ?? '').trim();
@@ -1192,28 +1285,225 @@ function pickFile(file) {
 }
 
 function gridFromSheet(workbook) {
+  DATE_EPOCH_SHIFT = (workbook.Workbook && workbook.Workbook.WBProps && workbook.Workbook.WBProps.date1904) ? 1462 : 0;
   const ws = workbook.Sheets[workbook.SheetNames[0]];
   return XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: true });
 }
 
-function readFileAsGrid(file) {
+function readArrayBuffer(file) {
   return new Promise((resolve, reject) => {
-    const ext = file.name.split('.').pop().toLowerCase();
-    if (ext === 'csv') {
+    const reader = new FileReader();
+    reader.onload = e => resolve(e.target.result);
+    reader.onerror = reject;
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+function looksLikePasswordError(err) {
+  const msg = String(err && err.message || err || '').toLowerCase();
+  return msg.includes('password') || msg.includes('encrypt');
+}
+
+// ============================================================
+// Password prompt modal. Returns the entered password, or null if the
+// user cancels. noteMsg (optional) shows a small red hint above the
+// buttons - used to say "that password didn't work" on a retry, or to
+// warn up front that this only works for the older .xls encryption.
+// ============================================================
+const pwOverlay = document.getElementById('pwOverlay');
+const pwTitle = document.getElementById('pwTitle');
+const pwMessage = document.getElementById('pwMessage');
+const pwInput = document.getElementById('pwInput');
+const pwNote = document.getElementById('pwNote');
+const pwCancel = document.getElementById('pwCancel');
+const pwUnlock = document.getElementById('pwUnlock');
+
+function askPassword(fileName, noteMsg) {
+  return new Promise(resolve => {
+    pwTitle.textContent = 'Password required';
+    pwMessage.textContent = `"${fileName}" is password protected. Enter the password to unlock it.`;
+    pwNote.textContent = noteMsg || '';
+    pwInput.value = '';
+    pwOverlay.classList.add('show');
+    setTimeout(() => pwInput.focus(), 50);
+
+    function cleanup(result) {
+      pwOverlay.classList.remove('show');
+      pwUnlock.removeEventListener('click', onUnlock);
+      pwCancel.removeEventListener('click', onCancel);
+      pwInput.removeEventListener('keydown', onKeydown);
+      resolve(result);
+    }
+    function onUnlock() { cleanup(pwInput.value || null); }
+    function onCancel() { cleanup(null); }
+    function onKeydown(e) {
+      if (e.key === 'Enter') onUnlock();
+      if (e.key === 'Escape') onCancel();
+    }
+    pwUnlock.addEventListener('click', onUnlock);
+    pwCancel.addEventListener('click', onCancel);
+    pwInput.addEventListener('keydown', onKeydown);
+  });
+}
+
+// ===== Office "Agile" (AES) password decryption for .xlsx (MS-OFFCRYPTO) =====
+const OC = (function () {
+  const te = new TextEncoder();
+  const HASH = { 'SHA1': 'SHA-1', 'SHA256': 'SHA-256', 'SHA384': 'SHA-384', 'SHA512': 'SHA-512' };
+  const b64 = s => { const b = atob(s); const u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; };
+  const cat = (...a) => { const n = a.reduce((t, x) => t + x.length, 0); const o = new Uint8Array(n); let p = 0; for (const x of a) { o.set(x, p); p += x.length; } return o; };
+  const le32 = n => new Uint8Array([n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255]);
+  const hex = h => new Uint8Array(h.match(/../g).map(x => parseInt(x, 16)));
+  const subtle = () => (globalThis.crypto && globalThis.crypto.subtle);
+
+  async function digest(alg, data) { return new Uint8Array(await subtle().digest(alg, data)); }
+  function fit(buf, len, pad) { const o = new Uint8Array(len).fill(pad); o.set(buf.subarray(0, Math.min(len, buf.length))); return o; }
+
+  // AES-CBC with NO padding. WebCrypto insists on PKCS7, so append one extra
+  // ciphertext block that decrypts to a valid padding block, then drop it.
+  async function aesCbcDecryptRaw(key, iv, data) {
+    const k = await subtle().importKey('raw', key, 'AES-CBC', false, ['encrypt', 'decrypt']);
+    const lastBlock = data.subarray(data.length - 16);
+    const padBlock = new Uint8Array(await subtle().encrypt({ name: 'AES-CBC', iv: lastBlock }, k, new Uint8Array(0)));
+    const out = new Uint8Array(await subtle().decrypt({ name: 'AES-CBC', iv }, k, cat(data, padBlock.subarray(0, 16))));
+    return out;
+  }
+
+  function isAgile(u8) {
+    if (!isEncryptedContainer(u8)) return false;
+    try { const st = readStreams(u8); return !!(st.info && st.pkg); } catch (e) { return false; }
+  }
+  function isEncryptedContainer(u8) {
+    return u8.length > 8 && u8[0] === 0xD0 && u8[1] === 0xCF && u8[2] === 0x11 && u8[3] === 0xE0;
+  }
+
+  function readStreams(u8) {
+    const cfb = XLSX.CFB.read(u8, { type: 'array' });
+    const get = n => { const e = XLSX.CFB.find(cfb, n); return e ? new Uint8Array(e.content) : null; };
+    return { info: get('EncryptionInfo'), pkg: get('EncryptedPackage') };
+  }
+
+  // returns { ok:true, data:Uint8Array } | { ok:false, reason:'password'|'unsupported'|'notencrypted', msg }
+  async function decrypt(u8, password) {
+    if (!subtle()) return { ok: false, reason: 'unsupported', msg: 'This browser blocks WebCrypto here (open the page from https:// or a local file in Chrome/Edge).' };
+    let s;
+    try { s = readStreams(u8); } catch (e) { return { ok: false, reason: 'notencrypted' }; }
+    if (!s.info || !s.pkg) return { ok: false, reason: 'notencrypted' };
+    const info = s.info;
+    const major = info[0] | (info[1] << 8), minor = info[2] | (info[3] << 8);
+    if (!(major === 4 && minor === 4)) {
+      return { ok: false, reason: 'unsupported', msg: `Encryption version ${major}.${minor} is not supported (only the modern "Agile" AES scheme used by Excel 2010+).` };
+    }
+    const xml = new TextDecoder('utf-8').decode(info.subarray(8)).replace(/^﻿/, '');
+    const doc = new DOMParser().parseFromString(xml, 'text/xml');
+    const q = (parent, name) => { const l = parent.getElementsByTagName('*'); for (const n of l) if (n.localName === name) return n; return null; };
+    const kd = q(doc, 'keyData'), ek = q(doc, 'encryptedKey');
+    if (!kd || !ek) return { ok: false, reason: 'unsupported', msg: 'Unrecognised encryption header.' };
+    const A = (n, a) => n.getAttribute(a);
+    const hAlg = HASH[A(ek, 'hashAlgorithm')], dAlg = HASH[A(kd, 'hashAlgorithm')];
+    if (!hAlg || !dAlg || A(ek, 'cipherAlgorithm') !== 'AES') return { ok: false, reason: 'unsupported', msg: 'Unsupported cipher/hash in this file.' };
+
+    const salt = b64(A(ek, 'saltValue'));
+    const spin = parseInt(A(ek, 'spinCount'), 10);
+    const keyBytes = parseInt(A(ek, 'keyBits'), 10) / 8;
+    const blockSize = parseInt(A(ek, 'blockSize'), 10);
+
+    let h = await digest(hAlg, cat(salt, utf16le(password)));
+    for (let i = 0; i < spin; i++) h = await digest(hAlg, cat(le32(i), h));
+
+    async function derive(blockKey) {
+      const hf = await digest(hAlg, cat(h, blockKey));
+      return fit(hf, keyBytes, 0x36);
+    }
+    const iv = fit(salt, blockSize, 0x36);
+
+    const vIn = await aesCbcDecryptRaw(await derive(hex('fea7d2763b4b9e79')), iv, b64(A(ek, 'encryptedVerifierHashInput')));
+    const vHashEnc = b64(A(ek, 'encryptedVerifierHashValue'));
+    const vHash = await aesCbcDecryptRaw(await derive(hex('d7aa0f6d3061344e')), iv, vHashEnc);
+    const calc = await digest(hAlg, vIn.subarray(0, parseInt(A(ek, 'saltSize'), 10)));
+    const hashLen = calc.length;
+    for (let i = 0; i < hashLen; i++) if (calc[i] !== vHash[i]) return { ok: false, reason: 'password' };
+
+    const kvEnc = b64(A(ek, 'encryptedKeyValue'));
+    const intermediate = (await aesCbcDecryptRaw(await derive(hex('146e0be7abacd0d6')), iv, kvEnc)).subarray(0, keyBytes);
+
+    // Decrypt the package in 4096-byte segments.
+    const pkg = s.pkg;
+    const size = new DataView(pkg.buffer, pkg.byteOffset, 8).getUint32(0, true);
+    const kdSalt = b64(A(kd, 'saltValue'));
+    const kdBlock = parseInt(A(kd, 'blockSize'), 10);
+    const body = pkg.subarray(8);
+    const out = new Uint8Array(Math.ceil(body.length / 4096) * 4096);
+    let seg = 0;
+    for (let off = 0; off < body.length; off += 4096, seg++) {
+      let chunk = body.subarray(off, Math.min(off + 4096, body.length));
+      if (chunk.length % 16) chunk = cat(chunk, new Uint8Array(16 - (chunk.length % 16)));
+      const ivS = fit(await digest(dAlg, cat(kdSalt, le32(seg))), kdBlock, 0x36);
+      out.set(await aesCbcDecryptRaw(intermediate, ivS, chunk), off);
+    }
+    return { ok: true, data: out.subarray(0, size) };
+  }
+
+  function utf16le(s) { const u = new Uint8Array(s.length * 2); for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); u[2 * i] = c & 255; u[2 * i + 1] = c >> 8; } return u; }
+
+  return { decrypt, isEncryptedContainer, isAgile };
+})();
+
+async function readFileAsGrid(file) {
+  const ext = file.name.split('.').pop().toLowerCase();
+
+  DATE_EPOCH_SHIFT = 0;
+  if (ext === 'csv') {
+    // Plain-text CSVs aren't encrypted the way xls/xlsx can be - no
+    // password handling needed here.
+    return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = e => resolve(Papa.parse(e.target.result, { skipEmptyLines: false }).data);
       reader.onerror = reject;
       reader.readAsText(file);
-    } else {
-      const reader = new FileReader();
-      reader.onload = e => {
-        try { resolve(gridFromSheet(XLSX.read(e.target.result, { type: 'array', cellDates: true }))); }
-        catch (err) { reject(err); }
-      };
-      reader.onerror = reject;
-      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  let buffer = await readArrayBuffer(file);
+  let password = '';
+  let note = '';
+
+  // --- Modern encrypted .xlsx (Office "Agile" AES): decrypt here ---------
+  if (OC.isAgile(new Uint8Array(buffer))) {
+    const u8 = new Uint8Array(buffer);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      password = await askPassword(file.name, note);
+      if (!password) throw new Error('Password required - import cancelled.');
+      setStatus('Unlocking file… (this takes a few seconds)', 'info');
+      await new Promise(r => setTimeout(r, 30));
+      const res = await OC.decrypt(u8, password);
+      if (res.ok) { buffer = res.data.buffer.slice(res.data.byteOffset, res.data.byteOffset + res.data.byteLength); break; }
+      if (res.reason === 'unsupported') throw new Error(res.msg);
+      note = 'That password did not work - try again.';
+      if (attempt === 3) throw new Error('Wrong password (3 attempts) - import cancelled.');
     }
-  });
+    password = '';
+    return gridFromSheet(XLSX.read(buffer, { type: 'array', cellDates: false }));
+  }
+
+  // --- Plain files and legacy .xls (XOR) protection ----------------------
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const opts = { type: 'array', cellDates: false };
+      if (password) opts.password = password;
+      return gridFromSheet(XLSX.read(buffer, opts));
+    } catch (err) {
+      if (/unsupported/i.test(String(err && err.message))) {
+        throw new Error('This old .xls file uses Excel 97-2003 "RC4" password protection, which a web page cannot decrypt. ' +
+          'Use the PRG/VBA importer for it, or open it in Excel, remove the password (Save As) and upload the copy.');
+      }
+      if (!looksLikePasswordError(err)) throw err;
+      password = await askPassword(file.name, note);
+      if (!password) throw new Error('Password required - import cancelled.');
+      note = 'That password did not work - try again.';
+    }
+  }
+  throw new Error('Could not unlock this file after 3 attempts. If it is an old .xls with "RC4" protection, open it in Excel, remove the password (Save As) and re-upload.');
 }
 
 // ============================================================
@@ -1227,6 +1517,12 @@ convertBtn.addEventListener('click', async () => {
   setBtnLoading(convertBtn, true);
   try {
     const grid = await readFileAsGrid(currentFile);
+    DATE_FAILS.length = 0;
+    let hashCells = 0;
+    for (const row of grid) for (const c of row) if (typeof c === 'string' && /^#{2,}$/.test(c.trim())) hashCells++;
+    if (hashCells > 0) {
+      alert(hashCells + ' cell(s) in this file contain the literal text "#######" (the statement was saved while its date column was too narrow). Those dates cannot be recovered - please re-export the statement with wider columns. Other columns will still import.');
+    }
     const choice = formatSelect.value;
     let rows = null, matchedId = null, matchedLabel = null;
 
@@ -1251,6 +1547,12 @@ convertBtn.addEventListener('click', async () => {
       }
     }
 
+    const noDate = rows.filter(r => !r.txnDate || !r.valDate).length;
+    if (noDate > 0) {
+      alert(noDate + ' of ' + rows.length + ' row(s) have a Transaction/Value Date this tool could not read.\n' +
+        (DATE_FAILS.length ? 'Example value(s) found in the file: ' + DATE_FAILS.map(x => '"' + x + '"').join(', ') + '\n' : '') +
+        'Please send this example so the format can be added. All other columns were imported.');
+    }
     rows = fillChqFromDescription(rows);
     rows.forEach(r => { r._source = currentFile.name; r._formatId = matchedId; r._formatLabel = matchedLabel; });
     allRecords = allRecords.concat(rows);
